@@ -505,31 +505,97 @@ static void xf16cam_capture_stream_stop(void)
 		OS_MutexUnlock(&g_capture_lock);
 }
 
+static int xf16cam_capture_still(CAMERA_JpegBuffInfo *info)
+{
+	xf16cam_sensor_prepare_capture();
+	return HAL_CAMERA_CaptureImage(CAMERA_OUT_JPEG, info, 1) == 0 ? 0 : -1;
+}
+
+static int xf16cam_capture_metadata_valid(const CAMERA_JpegBuffInfo *info)
+{
+	return info->buff_index < g_jpeg_buffer_count &&
+	       info->size != 0 &&
+	       info->size <= mem_mgmt.jpeg_buf[info->buff_index].size;
+}
+
+static void xf16cam_capture_video_fallback(void)
+{
+	if (!g_video_capture_active)
+		return;
+	(void)HAL_CAMERA_CaptureVideoStop();
+	g_video_capture_active = 0;
+	printf("xf16cam capture: continuous mode failed; falling back to still JPEG capture\n");
+}
+
 __xip_text
 static int xf16cam_capture_jpeg(CAMERA_JpegBuffInfo *info, uint8_t **jpeg,
 				uint32_t *jpeg_len)
 {
+	int was_video = g_video_capture_active;
 	int capture;
+	int metadata_valid;
 
-	if (g_video_capture_active) {
+	if (was_video)
 		capture = HAL_CAMERA_CaptureVideoData(info) == 0 ? 0 : -1;
-	} else {
-		xf16cam_sensor_prepare_capture();
-		capture = HAL_CAMERA_CaptureImage(CAMERA_OUT_JPEG, info, 1) == 0 ? 0 : -1;
+	else
+		capture = xf16cam_capture_still(info);
+
+	if (capture != 0 && was_video) {
+		xf16cam_capture_video_fallback();
+		capture = xf16cam_capture_still(info);
+		was_video = 0;
 	}
 	if (capture != 0) {
 		++g_media_info.capture_errors;
 		return -1;
 	}
-	if (info->buff_index >= g_jpeg_buffer_count || info->size == 0 ||
-	    info->size > mem_mgmt.jpeg_buf[info->buff_index].size) {
+
+	metadata_valid = xf16cam_capture_metadata_valid(info);
+	if (!metadata_valid && was_video) {
+		printf("xf16cam invalid video metadata: index=%u len=%lu; retrying still capture\n",
+		       info->buff_index, (unsigned long)info->size);
+		xf16cam_capture_video_fallback();
+		capture = xf16cam_capture_still(info);
+		was_video = 0;
+		if (capture == 0)
+			metadata_valid = xf16cam_capture_metadata_valid(info);
+	}
+	if (capture != 0) {
+		++g_media_info.capture_errors;
+		return -1;
+	}
+	if (!metadata_valid) {
 		++g_media_info.capture_errors;
 		printf("xf16cam invalid capture metadata: index=%u len=%lu\n",
 		       info->buff_index, (unsigned long)info->size);
 		return 1;
 	}
+
 	*jpeg = mem_mgmt.jpeg_buf[info->buff_index].addr - CAMERA_JPEG_HEADER_LEN;
 	*jpeg_len = info->size + CAMERA_JPEG_HEADER_LEN;
+	if (*jpeg_len < 4U || (*jpeg)[0] != 0xff || (*jpeg)[1] != 0xd8) {
+		if (was_video) {
+			printf("xf16cam invalid video JPEG header; retrying still capture\n");
+			xf16cam_capture_video_fallback();
+			capture = xf16cam_capture_still(info);
+			if (capture == 0 && xf16cam_capture_metadata_valid(info)) {
+				*jpeg = mem_mgmt.jpeg_buf[info->buff_index].addr -
+				        CAMERA_JPEG_HEADER_LEN;
+				*jpeg_len = info->size + CAMERA_JPEG_HEADER_LEN;
+			} else {
+				capture = -1;
+			}
+		} else {
+			capture = -1;
+		}
+		if (capture != 0 || *jpeg_len < 4U ||
+		    (*jpeg)[0] != 0xff || (*jpeg)[1] != 0xd8) {
+			++g_media_info.capture_errors;
+			printf("xf16cam invalid JPEG SOI: index=%u len=%lu\n",
+			       info->buff_index, (unsigned long)*jpeg_len);
+			return 1;
+		}
+	}
 	if (g_jpeg_send_buffer != NULL) {
 		memcpy(g_jpeg_send_buffer, *jpeg, *jpeg_len);
 		*jpeg = g_jpeg_send_buffer;
