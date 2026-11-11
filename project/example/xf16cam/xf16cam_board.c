@@ -244,7 +244,6 @@ __xip_text
 static void xf16cam_board_daynight_poll(void)
 {
 	uint16_t level;
-	int previous_night = g_cds_dark_state;
 	int auto_day_night = XF16CAM_AUTO_DAY_NIGHT(xf16cam_config_get());
 
 	if (xf16cam_board_cds_read(&level) != 0)
@@ -257,8 +256,6 @@ static void xf16cam_board_daynight_poll(void)
 		g_cds_dark_state = 1;
 	}
 
-	if (previous_night && !g_cds_dark_state)
-		g_white_boost_until_ms = 0;
 	if (!auto_day_night) {
 		if (!xf16cam_board_white_boost_active())
 			xf16cam_board_set_ir_led(0);
