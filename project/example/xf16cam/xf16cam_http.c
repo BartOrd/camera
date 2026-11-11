@@ -470,7 +470,7 @@ static void xf16cam_http_page(int fd)
 	if (XF16CAM_MOTION_ALARM_ENABLED(config))
 		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
 	XF16CAM_HTTP_SEND_LITERAL(fd, ">Sound alarm on</button></form>"
-	                  "<small>Motion turns on the white fill light for 30 seconds when movement is detected at night. The sound alarm works independently of Motion.</small>"
+	                  "<small>Motion turns on the white fill light for 15 seconds when movement is detected at night. The sound alarm works independently of Motion.</small>"
 	                  "<span id=motionResult aria-live=polite></span>"
 	                  "<span id=lightResult aria-live=polite></span></section></div>");
 	XF16CAM_HTTP_SEND_LITERAL(fd,
