@@ -454,11 +454,6 @@ int xf16cam_media_client_connected(int fd)
 /* Continuous capture rotates through multiple JPEG buffers while the client
  * receives the previously completed frame. */
 __xip_text
-__xip_text
-__xip_text
-/* Continuous capture rotates through multiple JPEG buffers while the client
- * receives the previously completed frame. */
-__xip_text
 static int xf16cam_capture_stream_start(void)
 {
 	if (g_jpeg_buffer_count > 1) {
@@ -484,6 +479,7 @@ static void xf16cam_capture_stream_stop(void)
 	}
 }
 
+__xip_text
 static int xf16cam_capture_jpeg(CAMERA_JpegBuffInfo *info, uint8_t **jpeg,
 				uint32_t *jpeg_len)
 {
@@ -955,7 +951,7 @@ static int xf16cam_stream_client(int fd, const char *ip)
 					goto stopped;
 				camera_acquired = 1;
 			}
-						timestamp = OS_TicksToMSecs(OS_GetTicks()) * 90U;
+			timestamp = OS_TicksToMSecs(OS_GetTicks()) * 90U;
 			audio_cursor = xf16cam_audio_cursor();
 			audio_timestamp = audio_cursor * XF16CAM_AUDIO_SAMPLES_PER_PACKET;
 		}
@@ -1126,7 +1122,7 @@ int main(void)
 	if (xf16cam_net_start(xf16cam_config_get()) != 0) {
 		printf("xf16cam network start failed; console recovery remains available\n");
 		if (camera_ready)
-			xf16cam_camera_release_boot_probe();
+		xf16cam_camera_release_boot_probe();
 		xf16cam_idle();
 	}
 	if (camera_ready && xf16cam_config_get()->media_mode == XF16CAM_MEDIA_RTSP) {
