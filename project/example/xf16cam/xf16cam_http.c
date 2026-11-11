@@ -1,0 +1,1340 @@
+#include <ctype.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#include "compiler.h"
+#include "kernel/os/os.h"
+#include "driver/chip/hal_flash.h"
+#include "driver/chip/hal_prcm.h"
+#include "driver/chip/hal_wdg.h"
+#include "driver/chip/system_chip.h"
+#include "lwip/sockets.h"
+#include "net/wlan/wlan.h"
+#include "net/wlan/wlan_ext_req.h"
+#include "ota/ota.h"
+#include "common/framework/net_ctrl.h"
+#include "common/framework/sysinfo.h"
+
+#include "xf16cam_config.h"
+#include "xf16cam_light.h"
+#include "xf16cam_audio.h"
+#include "xf16cam_motion.h"
+#include "xf16cam_board.h"
+#include "xf16cam_http.h"
+#include "xf16cam_media.h"
+#include "xf16cam_net.h"
+#include "xf16cam_power.h"
+#include "xf16cam_ptz.h"
+#include "xf16cam_sensor.h"
+#include "xf16cam_storage.h"
+#include "xf16cam_version.h"
+
+#define XF16CAM_HTTP_PORT         (80)
+#define XF16CAM_HTTP_REQUEST_SIZE (2048)
+#define XF16CAM_HTTP_SCAN_MAX     (12)
+#define XF16CAM_HTTP_STACK_SIZE   (3 * 1024)
+#define XF16CAM_OTA_MAX_SIZE      (372 * 1024)
+#define XF16CAM_HTTP_TIMEOUT_MS   (15000)
+#define XF16CAM_HTTP_HEADER_MS    (5000)
+#define XF16CAM_OTA_QUIESCE_MS    (10000U)
+#define XF16CAM_OTA_UPLOAD_MS     (180000U)
+
+enum {
+	XF16CAM_HTTP_KEEP_RUNNING = 0,
+	XF16CAM_HTTP_COLD_REBOOT,
+	XF16CAM_HTTP_OTA_REBOOT,
+	XF16CAM_HTTP_HIBERNATE,
+	XF16CAM_HTTP_DETACH_CLIENT,
+};
+
+static OS_Thread_t g_http_thread;
+/* Requests and scan results are consumed by the same HTTP task and never
+ * coexist. Sharing their storage returns 912 bytes to the SRAM heap. */
+static union {
+	char request[XF16CAM_HTTP_REQUEST_SIZE];
+	wlan_sta_ap_t scan_results[XF16CAM_HTTP_SCAN_MAX];
+} g_http_workspace;
+_Static_assert(sizeof(g_http_workspace.scan_results) <=
+	       sizeof(g_http_workspace.request),
+	       "HTTP scan results exceed the shared workspace");
+#define g_request      g_http_workspace.request
+#define g_scan_results g_http_workspace.scan_results
+static uint32_t g_flash_jedec;
+static uint32_t g_flash_size;
+
+static void xf16cam_http_message(int fd, const char *status, const char *message);
+
+extern void heap_get_space(uint8_t **start, uint8_t **end, uint8_t **current);
+
+__xip_text
+__attribute__((noinline))
+static const char *xf16cam_http_boot_reason(void)
+{
+	switch (SysGetStartupState()) {
+	case SYS_POWERON:            return "Power-on";
+	case SYS_WATCHDOG_CHIP_RST: return "Watchdog (chip)";
+	case SYS_WATCHDOG_CPU_RST:  return "Watchdog (CPU)";
+	case SYS_SLEEP:              return "Sleep wake";
+	case SYS_STANDBY:            return "Standby wake";
+	case SYS_HIBERNATION:        return "Hibernation wake";
+	case SYS_REBOOT:             return "Controlled reboot";
+	case SYS_CPU_RST:            return "Controlled CPU reset";
+	case SYS_NVIC_RST:           return "NVIC CPU reset";
+	default:                     return "Unknown";
+	}
+}
+
+__xip_text
+__attribute__((noinline))
+static int xf16cam_http_chip_temperature(void)
+{
+	wlan_ext_temp_volt_get_t temperature;
+	int32_t value;
+
+	if (g_wlan_netif == NULL ||
+	    wlan_ext_request(g_wlan_netif, WLAN_EXT_CMD_GET_TEMP_VOLT,
+	                     (int)&temperature) != 0)
+		return INT_MIN;
+	value = temperature.Temperature;
+	return value >= 0 ? (int)((value * 10 + 8) / 16) :
+	                    -(int)((-value * 10 + 8) / 16);
+}
+
+__xip_text
+static size_t xf16cam_http_heap_headroom(void)
+{
+	uint8_t *start;
+	uint8_t *end;
+	uint8_t *current;
+
+	heap_get_space(&start, &end, &current);
+	return (size_t)(end - current);
+}
+
+__attribute__((noinline))
+static void xf16cam_http_flash_info(uint32_t *jedec, uint32_t *size)
+{
+	struct FlashDev *device = getFlashDev(0);
+	struct FlashChip *chip = device != NULL ? getFlashChip(device) : NULL;
+	uint32_t capacity;
+
+	*jedec = 0;
+	*size = 0;
+	if (chip == NULL || HAL_Flash_Open(0, 1000) != HAL_OK)
+		return;
+	device->drv->open(chip);
+	chip->jedecID(chip, jedec);
+	(device->drv->close)(chip);
+	HAL_Flash_Close(0);
+
+	/* The third JEDEC byte is the binary capacity exponent for SPI NOR. */
+	capacity = (*jedec >> 16) & 0xff;
+	if (capacity >= 16 && capacity < 32)
+		*size = 1UL << capacity;
+}
+
+__xip_rodata static const char g_page_head[] =
+	"<!doctype html><html><head><meta charset=utf-8>"
+	"<meta name=viewport content='width=device-width,initial-scale=1'>"
+	"<title>XF16Cam</title><style>"
+	":root{--ink:#18212b;--muted:#647281;--line:#dbe2e8;--brand:#176b5b;--bg:#edf2f4}"
+	"*{box-sizing:border-box}body{font:15px system-ui;margin:0;background:var(--bg);color:var(--ink)}"
+	"header,main{width:min(1040px,calc(100% - 28px));margin:auto}header{display:flex;align-items:center;"
+	"justify-content:space-between;padding:18px 0 12px}h1{font-size:1.45rem;margin:0}h2{font-size:1.05rem;margin:0 0 14px}"
+	"p{line-height:1.45}.meta{color:var(--muted);font-size:.85rem}.pill{padding:5px 9px;"
+	"border-radius:999px;background:#dcece8;color:#125648;font-weight:650}.viewer,.card{background:#fff;border:1px solid var(--line);"
+	"border-radius:12px;box-shadow:0 2px 8px #18212b12}.viewer{padding:14px;margin-bottom:14px}.viewerTop{display:flex;"
+	"justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.screen{display:grid;place-items:center;"
+	"min-height:240px;background:#111820;border-radius:8px;overflow:hidden;color:#aeb9c2}.screen img{display:block;width:100%;"
+	"max-width:720px;max-height:70vh;object-fit:contain}.empty{text-align:center;padding:30px}.tabs{display:flex;gap:5px;overflow:auto;padding:5px;background:#dfe6ea;"
+	"border-radius:10px;margin:0 0 14px;position:sticky;top:0;z-index:2}.tabs button{flex:1;min-width:max-content;border:0;"
+	"background:transparent}.tabs button.on{background:#fff;color:var(--brand);box-shadow:0 1px 4px #0002}.panel{display:none}.panel.on{display:grid;"
+	"grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.card{padding:16px}.wide{grid-column:1/-1}.grid{display:grid;"
+	"grid-template-columns:max-content 1fr;gap:7px 14px}.grid b{color:#43515e}form{margin:8px 0}label{display:block;margin:8px 0}"
+	"input,button{font:inherit;min-height:44px;padding:9px 11px;margin:4px 0;border:1px solid #b9c5cd;border-radius:7px}input{width:100%;background:#fff;font-size:16px}"
+	"button{background:#f7f9fa;cursor:pointer}button:disabled{cursor:not-allowed}button.primary{background:var(--brand);border-color:var(--brand);color:#fff}"
+	"small{color:var(--muted)}a{color:#096b99}.rtsp{overflow-wrap:anywhere}.nets{display:grid;gap:7px;margin:10px 0}.net{width:100%;display:flex;gap:10px;"
+	"align-items:center;justify-content:space-between;text-align:left;margin:0;background:#fff}.net span:first-child{min-width:0;overflow-wrap:anywhere}.net span:last-child{flex:none;white-space:nowrap}.net.sel{border-color:var(--brand);"
+	"box-shadow:0 0 0 2px #176b5b33;background:#f3faf8}.net.empty{justify-content:center;color:var(--muted)}@media(max-width:680px){header{align-items:flex-start}.panel.on{grid-template-columns:1fr}"
+	".wide{grid-column:auto}.screen{min-height:180px}.grid{grid-template-columns:1fr}.grid b{margin-top:5px}}</style></head><body>";
+
+__xip_text
+static int xf16cam_http_send_all(int fd, const void *data, size_t length)
+{
+	const uint8_t *p = data;
+
+	while (length > 0) {
+		int sent = send(fd, p, length, 0);
+		if (sent <= 0)
+			return -1;
+		p += sent;
+		length -= sent;
+	}
+	return 0;
+}
+
+__xip_text
+static void xf16cam_http_send_text(int fd, const char *text)
+{
+	xf16cam_http_send_all(fd, text, strlen(text));
+}
+
+__xip_text
+static void xf16cam_http_runtime(int fd, char *dynamic, size_t size)
+{
+	uint32_t uptime = OS_TicksToMSecs(OS_GetTicks()) / 1000U;
+	int temperature = xf16cam_http_chip_temperature();
+	char temperature_text[20];
+	int length;
+
+	if (temperature == INT_MIN)
+		snprintf(temperature_text, sizeof(temperature_text), "Unavailable");
+	else
+		snprintf(temperature_text, sizeof(temperature_text), "%s%d.%d &deg;C",
+		         temperature < 0 ? "-" : "", abs(temperature) / 10,
+		         abs(temperature) % 10);
+	length = snprintf(dynamic, size,
+	                  "<section class=card><h2>Runtime</h2><div class=grid>"
+	                  "<b>Uptime</b><span>%lu days %02lu:%02lu:%02lu</span>"
+	                  "<b>Boot reason</b><span>%s</span>"
+	                  "<b>XF16 chip temperature</b><span>%s</span>"
+	                  "</div></section>",
+	                  (unsigned long)(uptime / 86400U),
+	                  (unsigned long)((uptime / 3600U) % 24U),
+	                  (unsigned long)((uptime / 60U) % 60U),
+	                  (unsigned long)(uptime % 60U), xf16cam_http_boot_reason(),
+	                  temperature_text);
+	if (length > 0 && (size_t)length < size)
+		xf16cam_http_send_all(fd, dynamic, (size_t)length);
+}
+
+#define XF16CAM_HTTP_JOIN_(a, b) a##b
+#define XF16CAM_HTTP_JOIN(a, b) XF16CAM_HTTP_JOIN_(a, b)
+#define XF16CAM_HTTP_SEND_LITERAL(fd, literal) do { \
+	__xip_rodata static const char XF16CAM_HTTP_JOIN(g_http_text_, __LINE__)[] = literal; \
+	xf16cam_http_send_all((fd), XF16CAM_HTTP_JOIN(g_http_text_, __LINE__), \
+	                      sizeof(XF16CAM_HTTP_JOIN(g_http_text_, __LINE__)) - 1); \
+} while (0)
+
+__xip_text
+static void xf16cam_http_begin(int fd, const char *status, const char *type)
+{
+	char header[192];
+	int length = snprintf(header, sizeof(header),
+	                      "HTTP/1.1 %s\r\nContent-Type: %s\r\n"
+	                      "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+	                      status, type);
+	xf16cam_http_send_all(fd, header, length);
+}
+
+__xip_text
+static void xf16cam_http_begin_length(int fd, const char *status, const char *type,
+	                                  size_t body_length)
+{
+	char header[224];
+	int length = snprintf(header, sizeof(header),
+	                      "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %lu\r\n"
+	                      "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+	                      status, type, (unsigned long)body_length);
+	xf16cam_http_send_all(fd, header, length);
+}
+
+__xip_text
+static void xf16cam_http_send_escaped(int fd, const uint8_t *text, size_t length,
+	                                  int json)
+{
+	size_t i;
+	char encoded[8];
+
+	for (i = 0; i < length; ++i) {
+		const char *replacement = NULL;
+		switch (text[i]) {
+		case '&': replacement = json ? "&" : "&amp;"; break;
+		case '<': replacement = json ? "<" : "&lt;"; break;
+		case '>': replacement = json ? ">" : "&gt;"; break;
+		case '"': replacement = json ? "\\\"" : "&quot;"; break;
+		case '\\': replacement = json ? "\\\\" : "\\"; break;
+		default: break;
+		}
+		if (replacement != NULL) {
+			xf16cam_http_send_text(fd, replacement);
+		} else if ((text[i] >= 0x20 && text[i] < 0x7f) || text[i] >= 0x80) {
+			xf16cam_http_send_all(fd, &text[i], 1);
+		} else if (json) {
+			snprintf(encoded, sizeof(encoded), "\\u%04x", text[i]);
+			xf16cam_http_send_text(fd, encoded);
+		}
+	}
+}
+
+__xip_text
+__attribute__((noinline))
+static void xf16cam_http_page(int fd)
+{
+	const XF16CamConfig *config = xf16cam_config_get();
+	const XF16CamAudioInfo *audio = xf16cam_audio_info();
+	const XF16CamMediaInfo *media = xf16cam_media_info();
+	const XF16CamStorageInfo *storage = xf16cam_storage_info();
+	const XF16CamPowerInfo *power = xf16cam_power_info();
+	const struct sysinfo *sysinfo = sysinfo_get();
+	int camera_available = xf16cam_sensor_available();
+	char camera_detail[48];
+	char camera_output[24];
+	char dynamic[640];
+	int length;
+
+	if (camera_available) {
+		snprintf(camera_detail, sizeof(camera_detail), "%s &middot; %ux%u JPEG",
+		         xf16cam_sensor_name(), (unsigned int)xf16cam_sensor_width(),
+		         (unsigned int)xf16cam_sensor_height());
+		snprintf(camera_output, sizeof(camera_output), "%ux%u",
+		         (unsigned int)xf16cam_sensor_width(),
+		         (unsigned int)xf16cam_sensor_height());
+	} else {
+		snprintf(camera_detail, sizeof(camera_detail), "No supported sensor detected");
+		snprintf(camera_output, sizeof(camera_output), "Unavailable");
+	}
+
+	xf16cam_http_begin(fd, "200 OK", "text/html; charset=utf-8");
+	xf16cam_http_send_text(fd, g_page_head);
+	length = snprintf(dynamic, sizeof(dynamic),
+	                  "<header><div><h1>XF16Cam</h1><div class=meta>Firmware %s</div></div>"
+	                  "<div><span class=pill>%s</span> <span class=meta>%s</span></div></header><main>"
+	                  "<section class=viewer><div class=viewerTop><div><b>Live camera</b>"
+	                  "<div class=meta>%s</div></div><span class=pill>%s</span></div>"
+	                  "<div class=screen>",
+	                  XF16CAM_VERSION,
+	                  xf16cam_net_mode() == XF16CAM_WIFI_STA ? "Station" : "Open AP",
+	                  xf16cam_net_ip(), camera_detail,
+	                  !camera_available ? "Offline" :
+	                  config->media_mode == XF16CAM_MEDIA_WEB ? "Browser MJPEG" : "RTSP");
+	xf16cam_http_send_all(fd, dynamic, length);
+	if (config->media_mode == XF16CAM_MEDIA_WEB) {
+		if (camera_available)
+			XF16CAM_HTTP_SEND_LITERAL(fd,
+			                  "<img id=video alt='Live camera'></div>");
+		else
+			XF16CAM_HTTP_SEND_LITERAL(fd,
+				                  "<div class=empty><b>Camera unavailable</b><p>Connect a sensor and reboot.</p></div></div>");
+	} else if (camera_available) {
+		length = snprintf(dynamic, sizeof(dynamic),
+		                  "<div class=rtsp><a href='rtsp://%s:8554/stream'>rtsp://%s:8554/stream</a>"
+		                  "<br><small>Open this address in VLC or another RTSP player.</small></div></div>",
+		                  xf16cam_net_ip(), xf16cam_net_ip());
+		xf16cam_http_send_all(fd, dynamic, length);
+	} else {
+		XF16CAM_HTTP_SEND_LITERAL(fd,
+		                  "<div class=empty><b>Camera unavailable</b><p>Connect a sensor to enable RTSP.</p></div></div>");
+	}
+	if ((config->media_mode == XF16CAM_MEDIA_WEB || !camera_available) && audio->available) {
+		XF16CAM_HTTP_SEND_LITERAL(fd,
+		                  "<div><button type=button id=listen onclick=toggleAudio()>Listen</button> "
+		                  "<span id=audioState aria-live=polite>Audio stopped</span></div>"
+		                  "<script>let a,r,n=0;function u(v){let x=(~v)&255,t=((x&15)<<3)+132;"
+		                  "t<<=(x&112)>>4;return((x&128)?132-t:t-132)/32768}async function toggleAudio(){"
+		                  "let b=document.querySelector('#listen'),s=document.querySelector('#audioState');"
+		                  "if(a){let c=a,q=r;a=r=null;b.disabled=true;try{if(q)await q.cancel()}catch(e){}"
+		                  "try{await c.close()}catch(e){}b.disabled=false;b.textContent='Listen';s.textContent='Audio stopped';return}"
+		                  "let c;try{c=new AudioContext;a=c;await c.resume();let f=await fetch('/stream.pcmu');if(!f.ok||!f.body)throw 0;"
+		                  "let p=f.body.getReader();if(a!==c){await p.cancel();return}r=p;b.textContent='Stop audio';s.textContent='Listening';"
+		                  "n=c.currentTime+.15;while(a===c){let x=await p.read();if(x.done||a!==c)break;let q=c.createBuffer(1,x.value.length,8000),d=q.getChannelData(0);"
+		                  "for(let i=0;i<d.length;i++)d[i]=u(x.value[i]);let o=a.createBufferSource();o.buffer=q;o.connect(a.destination);"
+		                  "let t=Math.max(n,a.currentTime+.04);o.start(t);n=t+q.duration}"
+		                  "if(a===c){a=r=null;b.textContent='Listen';s.textContent='Audio stopped';try{await c.close()}catch(e){}}}"
+		                  "catch(e){if(a===c){a=r=null;b.textContent='Listen';s.textContent='Audio connection failed';"
+		                  "try{if(c)await c.close()}catch(e){}}}}</script>");
+	}
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<form method=post action=/api/media>"
+	                  "<button name=mode value=web onclick='videoStop(1)'>Browser video</button> "
+	                  "<button name=mode value=rtsp onclick='videoStop(1)'>RTSP</button></form>"
+	                  "<small>Changing mode reboots.</small></section>"
+	                  "<nav class=tabs><button type=button data-tab=live onclick=tab('live')>Live</button>"
+	                  "<button type=button data-tab=network onclick=tab('network')>Network</button>"
+	                  "<button type=button data-tab=storage onclick=tab('storage')>Storage</button>"
+	                  "<button type=button data-tab=system onclick=tab('system')>System</button> "
+	                  "<button type=button data-tab=light onclick=tab('light')>Light</button> "
+		                  "<button type=button data-tab=position onclick=tab('position')>Position</button></nav>"
+	                  "<div id=live class=panel><section class=card><h2>Camera</h2><div class=grid>"
+	                  "<b>Sensor</b><span>");
+	xf16cam_http_send_text(fd, xf16cam_sensor_name());
+	length = snprintf(dynamic, sizeof(dynamic),
+	                  "</span><b>JPEG output</b><span>%s</span><b>Stream mode</b><span>%s</span>"
+	                  "<b>JPEG body buffer</b><span>%lu bytes</span><b>Frames captured</b><span>%lu</span>"
+	                  "<b>Largest JPEG body</b><span>%lu bytes</span><b>Capture errors</b><span>%lu</span></div>",
+	                  camera_output, !camera_available ? "Disabled (no sensor)" :
+	                  config->media_mode == XF16CAM_MEDIA_WEB ? "Browser MJPEG" : "RTSP",
+	                  (unsigned long)media->jpeg_capacity, (unsigned long)media->frames,
+	                  (unsigned long)media->largest_jpeg,
+	                  (unsigned long)media->capture_errors);
+	xf16cam_http_send_all(fd, dynamic, length);
+	if (xf16cam_sensor_supports_vga()) {
+		if (xf16cam_sensor_width() == 640)
+			XF16CAM_HTTP_SEND_LITERAL(fd,
+			                  "<form method=post action=/api/resolution>"
+			                  "<button name=resolution value=qvga>320x240</button> "
+			                  "<button disabled>640x480 (active)</button></form>");
+		else
+			XF16CAM_HTTP_SEND_LITERAL(fd,
+			                  "<form method=post action=/api/resolution>"
+			                  "<button disabled>320x240 (active)</button> "
+			                  "<button name=resolution value=vga>640x480</button></form>");
+		XF16CAM_HTTP_SEND_LITERAL(fd,
+		                  "<small>Changing resolution reboots. VGA uses more bandwidth and may reduce frame rate.</small>");
+	}
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</section><section class=card><h2>Audio</h2><div class=grid><b>Microphone</b><span>");
+	length = snprintf(dynamic, sizeof(dynamic),
+	                  "%s</span><b>Peak level</b><span><span id=mic>%u</span>/32768</span></div></section></div>",
+	                  !audio->available ? "AMIC unavailable" :
+	                  audio->active ? "AMIC active, PCMU/8000" : "AMIC ready (on demand)", audio->peak);
+	xf16cam_http_send_all(fd, dynamic, length);
+
+
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<div id=light class=panel><section class='card wide'><h2>Light</h2>"
+	                  "<div class=grid><b>Light</b><span><span id=lightStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_ENABLED(config) ? "Enabled (PB20 HIGH)" : "Disabled (PB20 LOW)");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></span><b>Light intensity</b><span><span id=intensityStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_STRONGER(config) ? "Stronger (PB3 OUTPUT LOW)" : "Weaker (PB3 INPUT)");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></span><b>Automatic day/night</b><span><span id=dayNightStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_AUTO_DAY_NIGHT(config) ? "Enabled" : "Disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></span><b>IR LED</b><span><span id=irStatus>");
+	xf16cam_http_send_text(fd, xf16cam_board_ir_led_on() ? "On (PA22)" : "Off (PA22)");
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</span></span><b>Motion detection</b><span id=motionStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_MOTION_ENABLED(config) ? "Enabled" : "Disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Sound alarm</b><span id=motionAlarmStatus>");
+	xf16cam_http_send_text(fd, XF16CAM_MOTION_ALARM_ENABLED(config) ? "Enabled" : "Disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Motion events</b><span id=motionEvents>");
+	length = snprintf(dynamic, sizeof(dynamic), "%lu",
+	                  (unsigned long)xf16cam_board_motion_events());
+	xf16cam_http_send_all(fd, dynamic, length);
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Last motion</b><span id=motionLast>");
+	if (xf16cam_board_motion_active())
+		XF16CAM_HTTP_SEND_LITERAL(fd, "Motion detected");
+	else if (xf16cam_board_motion_age_ms() == 0xffffffffUL)
+		XF16CAM_HTTP_SEND_LITERAL(fd, "No events");
+	else {
+		length = snprintf(dynamic, sizeof(dynamic), "%lu s ago",
+		                  (unsigned long)(xf16cam_board_motion_age_ms() / 1000U));
+		xf16cam_http_send_all(fd, dynamic, length);
+	}
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</span></span></div><form method=post action=/api/light>"
+	                  "<button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_ENABLED(config) ? "0" : "1");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=light value=disabled");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || !XF16CAM_LIGHT_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Disabled</button> <button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_ENABLED(config) ? "1" : "0");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=light value=enabled");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || XF16CAM_LIGHT_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Enabled</button></form><form method=post action=/api/light>"
+	                  "<button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_STRONGER(config) ? "0" : "1");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=intensity value=weaker");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || !XF16CAM_LIGHT_STRONGER(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Weaker</button> <button class=manual-light data-active=");
+	xf16cam_http_send_text(fd, XF16CAM_LIGHT_STRONGER(config) ? "1" : "0");
+	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=intensity value=stronger");
+	if (XF16CAM_AUTO_DAY_NIGHT(config) || XF16CAM_LIGHT_STRONGER(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Stronger</button></form><form method=post action=/api/light>"
+	                  "<button type=submit onclick='lightSubmit(this);return false' name=daynight value=disabled");
+	if (!XF16CAM_AUTO_DAY_NIGHT(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Auto day/night off</button> "
+	                  "<button type=submit onclick='lightSubmit(this);return false' name=daynight value=enabled");
+	if (XF16CAM_AUTO_DAY_NIGHT(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Auto day/night on</button></form>"
+	                  "<small>Automatic mode disables manual light controls and switches the IR-cut filter / IR LED using the light sensor.</small>"
+	                  "<form method=post action=/api/motion><button onclick='motionSubmit(this);return false' name=motion value=disabled");
+	if (!XF16CAM_MOTION_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Motion off</button> <button onclick='motionSubmit(this);return false' name=motion value=enabled");
+	if (XF16CAM_MOTION_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Motion on</button></form>"
+	                  "<form method=post action=/api/motion><button onclick='motionSubmit(this);return false' name=alarm value=disabled");
+	if (!XF16CAM_MOTION_ALARM_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Sound alarm off</button> <button onclick='motionSubmit(this);return false' name=alarm value=enabled");
+	if (XF16CAM_MOTION_ALARM_ENABLED(config))
+		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
+	XF16CAM_HTTP_SEND_LITERAL(fd, ">Sound alarm on</button></form>"
+	                  "<small>Motion turns on the white fill light for 30 seconds when movement is detected at night. The sound alarm works independently of Motion.</small>"
+	                  "<span id=motionResult aria-live=polite></span>"
+	                  "<span id=lightResult aria-live=polite></span></section></div>");
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<div id=position class=panel><section class='card wide'><h2>Position</h2>"
+	                  
+	                  "<div style='display:grid;grid-template-columns:repeat(3,64px);gap:6px;width:max-content;margin:12px auto'>"
+	                  "<span></span><button type=button value=up style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>▲</button><span></span>"
+	                  "<button type=button value=left style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>◀</button>"
+	                  "<span style='display:grid;place-items:center'>PTZ</span>"
+	                  "<button type=button value=right style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>▶</button>"
+	                  "<span></span><button type=button value=down style='touch-action:none;user-select:none' onpointerdown='ptzPress(event,this)' onpointerup='ptzRelease(event)' onpointercancel='ptzCancel(event)'>▼</button><span></span>"
+	                  "</div><span id=positionResult aria-live=polite>Ready</span></section></div>");
+
+
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<div id=network class=panel><section class='card wide'><h2>Wi-Fi setup</h2>"
+	                  "<p>Tap a scan result, or enter a hidden SSID.</p>"
+	                  "<button type=button id=scanButton onclick=scan()>Scan networks</button> <span id=scan aria-live=polite></span>"
+	                  "<div id=networks class=nets aria-live=polite></div>"
+	                  "<form method=post action=/api/wifi><label>Network name (SSID)"
+	                  "<input id=ssid name=ssid maxlength=32 required autocapitalize=none spellcheck=false oninput=clearNet() value=\"");
+	xf16cam_http_send_escaped(fd, (const uint8_t *)config->ssid, strlen(config->ssid), 0);
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "\"></label>"
+	                  "<label>Password<input type=password name=password maxlength=63 autocomplete=new-password>"
+	                  "<small>Blank keeps the saved password for the current SSID, or joins a new open network.</small></label>"
+	                  "<button class=primary type=submit>Save and reboot</button></form>"
+	                  "<form method=post action=/api/ap><button type=submit>Return to open AP</button></form></section></div>"
+	                  "<div id=storage class=panel><section class='card wide'><h2>SD card</h2><div class=grid>"
+	                  "<b>Status</b><span>");
+	if (storage->mounted) {
+		length = snprintf(dynamic, sizeof(dynamic),
+		                  "Mounted</span><b>Capacity</b><span>%lu MiB</span>"
+		                  "<b>Free space</b><span>%lu MiB</span></div>",
+		                  (unsigned long)storage->total_mb, (unsigned long)storage->free_mb);
+		xf16cam_http_send_all(fd, dynamic, length);
+		XF16CAM_HTTP_SEND_LITERAL(fd,
+		                  "<form method=post action=/api/sd/eject><button type=submit>Safely eject</button></form>");
+	} else {
+		XF16CAM_HTTP_SEND_LITERAL(fd, "Not checked</span></div>");
+	}
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<form method=post action=/api/sd/refresh><button type=submit>Check card</button></form>"
+	                  "<form method=post action=/api/sd/format onsubmit=\"return confirm('Erase and format the SD card?')\">"
+	                  "<button type=submit>Format FAT32</button></form>"
+	                  "<small>Formatting permanently erases the card. Ejecting lets the shared PA23 camera/SD rail power down while idle.</small></section></div>"
+	                  "<div id=system class=panel><section class=card><h2>Device</h2><div class=grid>");
+	length = snprintf(dynamic, sizeof(dynamic),
+	                  "<b>Network mode</b><span>%s</span><b>IP address</b><span>%s</span>"
+	                  "<b>Wi-Fi MAC</b><span>%02X:%02X:%02X:%02X:%02X:%02X (eFuse)</span>"
+	                  "<b>Heap top reserve</b><span>%lu bytes</span><b>Flash JEDEC ID</b><span>%02lX %02lX %02lX</span>"
+	                  "<b>Flash capacity</b><span>%lu KiB</span><b>Mode button</b><span>PA15 (%s)</span>"
+	                  "<b>Setup button</b><span>PA20 (%s)</span>",
+	                  xf16cam_net_mode() == XF16CAM_WIFI_STA ? "Station" : "Open AP", xf16cam_net_ip(),
+	                  sysinfo->mac_addr[0], sysinfo->mac_addr[1], sysinfo->mac_addr[2],
+	                  sysinfo->mac_addr[3], sysinfo->mac_addr[4], sysinfo->mac_addr[5],
+	                  (unsigned long)xf16cam_http_heap_headroom(),
+	                  (unsigned long)(g_flash_jedec & 0xff),
+	                  (unsigned long)((g_flash_jedec >> 8) & 0xff),
+	                  (unsigned long)((g_flash_jedec >> 16) & 0xff),
+	                  (unsigned long)(g_flash_size / 1024),
+	                  xf16cam_board_mode_button_pressed() ? "pressed" : "released",
+	                  xf16cam_board_reset_button_pressed() ? "pressed" : "released");
+	xf16cam_http_send_all(fd, dynamic, length);
+	length = snprintf(dynamic, sizeof(dynamic),
+	                  "<b>HTTP stack spare</b><span>%lu bytes</span>"
+	                  "<b>Audio stack spare</b><span>%lu bytes</span>"
+	                  "<b>Board stack spare</b><span>%lu bytes</span></div></section>",
+	                  (unsigned long)OS_ThreadGetStackMinFreeSize(&g_http_thread),
+	                  (unsigned long)xf16cam_audio_stack_min_free(),
+	                  (unsigned long)xf16cam_board_stack_min_free());
+	xf16cam_http_send_all(fd, dynamic, length);
+	xf16cam_http_runtime(fd, dynamic, sizeof(dynamic));
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<section class=card><h2>XF16 pin map</h2><div class=grid>"
+	                  "<b>Camera CSI</b><span>PA0-PA11</span>"
+	                  "<b>Camera control</b><span>PA14</span>"
+	                  "<b>Status LED</b><span>PA21</span>"
+	                  "<b>Battery sense</b><span>PA16 / ADC6</span>"
+	                  "<b>Camera / SD power rail</b><span>PA23</span>"
+	                  "<b>SD card</b><span>PB16 CMD, PB17 D0, PB18 CLK</span>"
+	                  "<b>Console</b><span>PB0 TX, PB1 RX</span>"
+	                  "<b>SPI flash</b><span>PB2-PB7</span>"
+	                  "<b>Mode button</b><span>PA15; short press switches Web/RTSP</span>"
+	                  "<b>Setup button</b><span>PA20; hold 3 seconds to restore AP</span>"
+	                  "</div></section><section class=card><h2>Power</h2><div class=grid>"
+	                  "<b>Battery input</b><span id=battery>");
+	if (power->valid) {
+		length = snprintf(dynamic, sizeof(dynamic), "%u mV (raw %u, approx.)",
+		                  power->millivolts, power->raw);
+		xf16cam_http_send_all(fd, dynamic, length);
+	} else {
+		XF16CAM_HTTP_SEND_LITERAL(fd, "Not measured");
+	}
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</span><b>Charging</b><span>Unknown</span>"
+	                  "</div><button type=button onclick=measurePower()>Measure voltage</button>"
+	                  "<form method=post action=/api/hibernate onsubmit=\"return confirm('Hibernate? Press PA20 to wake.')\">"
+	                  "<button type=submit>Hibernate</button></form>"
+	                  "<small>Approximate; no auto cutoff.</small></section>");
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<section class='card wide'><h2>Firmware update</h2><p>Choose an OTA image and keep power connected.</p>"
+	                  "<input id=ota type=file accept=.img><button id=otaInstall class=primary type=button onclick=update()>Install update</button> <span id=up aria-live=polite></span></section></div>"
+	                  "<script>let D=document,$=s=>D.querySelector(s),A=s=>D.querySelectorAll(s),vt,vh=0;"
+	                  "function videoStop(h){if(h)vh=1;clearTimeout(vt);let v=$('#video');if(v)v.removeAttribute('src')}"
+	                  "function videoStart(){let v=$('#video');if(!v||vh||D.hidden)return;clearTimeout(vt);v.src='/stream.mjpeg'}"
+	                  "function videoRetry(){clearTimeout(vt);if(!vh&&!D.hidden)vt=setTimeout(videoStart,1500)}"
+	                  "function tab(id){A('.panel').forEach(e=>e.classList.toggle('on',e.id==id));"
+	                  "A('.tabs button').forEach(e=>{let on=e.dataset.tab==id;e.classList.toggle('on',on);e.setAttribute('aria-selected',on)})}"
+	                  "function lightSubmit(b){let f=b.form,s=$('#lightResult'),k=b.name,v=b.value;"
+	                  "if(!f||b.disabled)return false;b.disabled=true;s.textContent='Saving...';"
+	                  "fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+	                  "body:encodeURIComponent(k)+'='+encodeURIComponent(v)})"
+	                  ".then(r=>{if(!r.ok)throw 0;return r.text()})"
+	                  ".then(()=>{if(k==='light')$('#lightStatus').textContent=v==='enabled'?'Enabled (PB20 HIGH)':'Disabled (PB20 LOW)';"
+	                  "else if(k==='intensity')$('#intensityStatus').textContent=v==='stronger'?'Stronger (PB3 OUTPUT LOW)':'Weaker (PB3 INPUT)';"
+	                  "else $('#dayNightStatus').textContent=v==='enabled'?'Enabled':'Disabled';"
+	                  "if(k==='light'||k==='intensity')f.querySelectorAll('button').forEach(x=>{let a=x.value===v;x.dataset.active=a?'1':'0';"
+	                  "x.disabled=a||$('#dayNightStatus').textContent==='Enabled'});"
+	                  "else{f.querySelectorAll('button').forEach(x=>x.disabled=x.value===v);"
+	                  "A('.manual-light').forEach(x=>x.disabled=v==='enabled'||x.dataset.active==='1')}"
+	                  "s.textContent='Saved'})"
+	                  ".catch(()=>{s.textContent='Save failed';b.disabled=false});return false}"
+	                  "function motionSubmit(b){let f=b.form,s=$('#motionResult'),k=b.name,v=b.value;"
+	                  "if(!f||b.disabled)return false;b.disabled=true;s.textContent='Saving...';"
+	                  "fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+	                  "body:encodeURIComponent(k)+'='+encodeURIComponent(v)})"
+	                  ".then(r=>{if(!r.ok)throw 0;return r.text()})"
+	                  ".then(()=>{f.querySelectorAll('button').forEach(x=>x.disabled=x.value===v);s.textContent='Saved'})"
+	                  ".catch(()=>{s.textContent='Save failed';b.disabled=false});return false}"
+	                  "let ptzPressTimer=0,ptzHolding=false,ptzMode='',ptzStartPromise=null;"
+                  "async function ptzSend(mode,action){let d=new URLSearchParams();d.set('mode',mode);d.set('action',action);"
+                  "let r=await fetch('/api/ptz',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:d.toString()});"
+                  "if(!r.ok)throw 0;return r.text()}"
+                  "function ptzPress(e,b){if(ptzHolding||ptzPressTimer)return;"
+                  "if(e.pointerType==='mouse'&&e.button!==0)return;e.preventDefault();ptzMode=b.value;"
+                  "try{b.setPointerCapture(e.pointerId)}catch(x){}ptzPressTimer=setTimeout(()=>{ptzPressTimer=0;"
+                  "ptzHolding=true;$('#positionResult').textContent='Moving...';"
+                  "ptzStartPromise=ptzSend(ptzMode,'start');ptzStartPromise.catch(()=>{ptzHolding=false;$('#positionResult').textContent='Movement failed'})},250)}"
+                  "function ptzRelease(e){if(ptzPressTimer&&!ptzHolding){clearTimeout(ptzPressTimer);ptzPressTimer=0;"
+                  "let m=ptzMode;$('#positionResult').textContent='Moving...';"
+                  "ptzSend(m,'step').then(()=>$('#positionResult').textContent='Movement complete')"
+                  ".catch(()=>$('#positionResult').textContent='Movement failed');return}"
+                  "if(ptzHolding){ptzHolding=false;Promise.resolve(ptzStartPromise).then(()=>ptzSend(ptzMode,'stop')).then(()=>$('#positionResult').textContent='Stopped')"
+                  ".catch(()=>$('#positionResult').textContent='Stop failed')}}"
+                  "function ptzCancel(e){if(ptzPressTimer)clearTimeout(ptzPressTimer);ptzPressTimer=0;"
+                  "if(ptzHolding){ptzHolding=false;Promise.resolve(ptzStartPromise).then(()=>ptzSend(ptzMode,'stop')).catch(()=>{});$('#positionResult').textContent='Stopped'}}"
+                  "D.addEventListener('visibilitychange',()=>{if(D.hidden)ptzCancel()});"
+                  "D.addEventListener('blur',ptzCancel);"
+                  "function clearNet(){A('.net').forEach(e=>e.classList.remove('sel'))}"
+	                  "function pickNet(b){$('#ssid').value=b.dataset.ssid;clearNet();b.classList.add('sel');"
+	                  "$('input[name=password]').focus()}"
+	                  "async function scan(){let s=$('#scan'),b=$('#scanButton'),d=$('#networks');"
+	                  "s.textContent='Scanning...';b.disabled=true;d.innerHTML='';try{let r=await fetch('/api/scan');if(!r.ok)throw 0;let a=await r.json();"
+	                  "a.sort((x,y)=>y.rssi-x.rssi);a.forEach(n=>{let o=D.createElement('button'),x=D.createElement('span'),m=D.createElement('span');"
+	                  "o.type='button';o.className='net';o.dataset.ssid=n.ssid;o.onclick=()=>pickNet(o);x.textContent=n.ssid||'(hidden network)';"
+	                  "m.textContent=n.rssi+' dBm · '+(n.secure?'Secured':'Open');o.append(x,m);d.append(o)});"
+	                  "if(!a.length)d.innerHTML='<div class=\"net empty\">No networks found</div>';s.textContent=a.length+' found'}"
+	                  "catch(e){s.textContent='Scan failed';d.innerHTML='<div class=\"net empty\">Try scanning again</div>'}finally{b.disabled=false}}"
+	                  "async function measurePower(){let b=$('#battery');b.textContent='Measuring...';try{let r=await fetch('/api/power',{method:'POST'});"
+	                  "if(!r.ok)throw 0;let p=await r.json();b.textContent=p.millivolts+' mV (raw '+p.raw+', approx.)'}catch(e){b.textContent='Measurement failed'}}"
+	                  "async function update(){let f=$('#ota').files[0],s=$('#up'),b=$('#otaInstall');if(b.disabled)return;"
+	                  "if(!f){s.textContent='Choose a file';return}if(!confirm('Install '+f.name+' and reboot?'))return;"
+	                  "b.disabled=true;videoStop(1);s.textContent='Uploading...';let ok=false;try{let r=await fetch('/api/ota',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f}),t=await r.text();"
+	                  "ok=r.ok;s.textContent=ok?t:'Update failed (HTTP '+r.status+')'}catch(e){s.textContent='Connection closed; check for reboot'}finally{b.disabled=false;if(!ok){vh=0;videoStart()}}}"
+	                  "async function meter(){if(!D.hidden&&$('#live').classList.contains('on'))try{"
+	                  "let a=await(await fetch('/api/audio')).json(),m=$('#mic');if(m)m.textContent=a.peak}catch(e){}setTimeout(meter,2000)}"
+	                  "async function motionPoll(){if(!D.hidden)try{let m=await(await fetch('/api/motion')).json();"
+	                  "$('#motionStatus').textContent=m.enabled?'Enabled':'Disabled';$('#motionAlarmStatus').textContent=m.alarm?'Enabled':'Disabled';"
+	                  "$('#motionEvents').textContent=m.events;$('#motionLast').textContent=m.active?'Motion detected':"
+	                  "m.age_ms===4294967295?'No events':Math.floor(m.age_ms/1000)+' s ago'}catch(e){}setTimeout(motionPoll,2000)}"
+	                  "let v=$('#video');if(v){v.onerror=videoRetry;videoStart()}"
+	                  "D.addEventListener('visibilitychange',()=>D.hidden?videoStop():videoStart());"
+	                  "tab('live');meter();motionPoll()</script></main></body></html>");
+}
+
+__xip_text
+static void xf16cam_http_audio_json(int fd)
+{
+	const XF16CamAudioInfo *audio = xf16cam_audio_info();
+	char body[128];
+	int length = snprintf(body, sizeof(body),
+	                      "{\"available\":%s,\"active\":%s,\"peak\":%u,\"mean\":%u,\"packets\":%lu,\"read_errors\":%lu}",
+	                      audio->available ? "true" : "false", audio->active ? "true" : "false", audio->peak, audio->mean,
+	                      (unsigned long)audio->packets, (unsigned long)audio->read_errors);
+
+	xf16cam_http_begin_length(fd, "200 OK", "application/json", length);
+	xf16cam_http_send_all(fd, body, length);
+}
+
+__xip_text
+static void xf16cam_http_power_json(int fd)
+{
+	const XF16CamPowerInfo *power;
+	char body[80];
+	int length;
+
+	if (xf16cam_power_measure() != 0) {
+		xf16cam_http_message(fd, "503 Service Unavailable", "Battery read failed.");
+		return;
+	}
+	power = xf16cam_power_info();
+	length = snprintf(body, sizeof(body),
+	                  "{\"raw\":%u,\"millivolts\":%u,\"calibrated\":false}",
+	                  power->raw, power->millivolts);
+	xf16cam_http_begin_length(fd, "200 OK", "application/json", length);
+	xf16cam_http_send_all(fd, body, length);
+}
+
+__xip_text
+static int xf16cam_http_scan(void)
+{
+	wlan_sta_scan_results_t results;
+	int count = 0;
+
+	if (xf16cam_net_mode() == XF16CAM_WIFI_AP) {
+		wlan_ap_scan_bss_max_count(XF16CAM_HTTP_SCAN_MAX);
+		if (wlan_ap_scan_once() != 0)
+			return -1;
+	} else {
+		wlan_sta_bss_max_count(XF16CAM_HTTP_SCAN_MAX);
+		if (wlan_sta_scan_once() != 0)
+			return -1;
+	}
+	OS_MSleep(1500);
+	results.ap = g_scan_results;
+	results.size = XF16CAM_HTTP_SCAN_MAX;
+	if (xf16cam_net_mode() == XF16CAM_WIFI_AP) {
+		if (wlan_ap_scan_result(&results) != 0)
+			return -1;
+	} else if (wlan_sta_scan_result(&results) != 0) {
+		return -1;
+	}
+	count = results.num;
+	return count > XF16CAM_HTTP_SCAN_MAX ? XF16CAM_HTTP_SCAN_MAX : count;
+}
+
+__xip_text
+static void xf16cam_http_scan_json(int fd)
+{
+	int count = xf16cam_http_scan();
+	int i;
+	char item[80];
+
+	if (count < 0) {
+		xf16cam_http_begin(fd, "503 Service Unavailable", "application/json");
+		xf16cam_http_send_text(fd, "{\"error\":\"scan failed\"}");
+		return;
+	}
+	xf16cam_http_begin(fd, "200 OK", "application/json");
+	xf16cam_http_send_text(fd, "[");
+	for (i = 0; i < count; ++i) {
+		wlan_sta_ap_t *ap = &g_scan_results[i];
+		if (i > 0)
+			xf16cam_http_send_text(fd, ",");
+		xf16cam_http_send_text(fd, "{\"ssid\":\"");
+		xf16cam_http_send_escaped(fd, ap->ssid.ssid, ap->ssid.ssid_len, 1);
+		snprintf(item, sizeof(item), "\",\"rssi\":%d,\"secure\":%s}",
+		         ap->level, (ap->wpa_key_mgmt || ap->rsn_key_mgmt) ? "true" : "false");
+		xf16cam_http_send_text(fd, item);
+	}
+	xf16cam_http_send_text(fd, "]");
+}
+
+__xip_text
+static int xf16cam_hex(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+__xip_text
+static int xf16cam_form_value(const char *body, const char *key,
+	                          char *out, size_t out_size)
+{
+	size_t key_len = strlen(key);
+	const char *p = body;
+	size_t used = 0;
+
+	while (*p != '\0') {
+		if ((p == body || p[-1] == '&') && strncmp(p, key, key_len) == 0 && p[key_len] == '=') {
+			p += key_len + 1;
+			while (*p != '\0' && *p != '&') {
+				char value = *p++;
+				if (value == '+') {
+					value = ' ';
+				} else if (value == '%' && p[0] != '\0' && p[1] != '\0' &&
+				           isxdigit((unsigned char)p[0]) && isxdigit((unsigned char)p[1])) {
+					value = (char)((xf16cam_hex(p[0]) << 4) | xf16cam_hex(p[1]));
+					p += 2;
+				}
+				if (used + 1 >= out_size)
+					return -1;
+				out[used++] = value;
+			}
+			out[used] = '\0';
+			return 0;
+		}
+		p = strchr(p, '&');
+		if (p == NULL)
+			break;
+		++p;
+	}
+	return -1;
+}
+
+__xip_text
+static void xf16cam_http_message(int fd, const char *status, const char *message)
+{
+	static const char prefix[] = "<section><h1>XF16Cam</h1><p>";
+	static const char suffix[] = "</p><a href='/'>Return</a></section></body></html>";
+	size_t length = sizeof(g_page_head) - 1 + sizeof(prefix) - 1 + strlen(message) + sizeof(suffix) - 1;
+
+	xf16cam_http_begin_length(fd, status, "text/html; charset=utf-8", length);
+	xf16cam_http_send_all(fd, g_page_head, sizeof(g_page_head) - 1);
+	xf16cam_http_send_all(fd, prefix, sizeof(prefix) - 1);
+	xf16cam_http_send_text(fd, message);
+	xf16cam_http_send_all(fd, suffix, sizeof(suffix) - 1);
+}
+
+__xip_text
+static int xf16cam_http_content_length(char *request, char *header_end, int *length)
+{
+	char *line = strstr(request, "\r\n");
+	int found = 0;
+
+	*length = 0;
+
+	while (line != NULL && line < header_end) {
+		char *end;
+		char *value;
+		unsigned int parsed = 0;
+
+		line += 2;
+		if (line >= header_end)
+			break;
+		end = strstr(line, "\r\n");
+		if (end == NULL || end > header_end)
+			return -1;
+		if (end - line < (int)sizeof("Content-Length:") - 1 ||
+		    strncasecmp(line, "Content-Length", sizeof("Content-Length") - 1) != 0 ||
+		    line[sizeof("Content-Length") - 1] != ':') {
+			line = end;
+			continue;
+		}
+		if (found)
+			return -1;
+		value = line + sizeof("Content-Length");
+		while (value < end && (*value == ' ' || *value == '\t'))
+			++value;
+		if (value == end || *value < '0' || *value > '9')
+			return -1;
+		while (value < end && *value >= '0' && *value <= '9') {
+			unsigned int digit = (unsigned int)(*value++ - '0');
+			if (parsed > ((unsigned int)INT_MAX - digit) / 10U)
+				return -1;
+			parsed = parsed * 10U + digit;
+		}
+		while (value < end && (*value == ' ' || *value == '\t'))
+			++value;
+		if (value != end)
+			return -1;
+		*length = (int)parsed;
+		found = 1;
+		line = end;
+	}
+	return 0;
+}
+
+/* Apply both a total deadline and the normal per-read stall timeout. */
+static int xf16cam_http_recv_deadline(int fd, void *buffer, int length,
+				      uint32_t start, uint32_t total_ms)
+{
+	uint32_t elapsed = OS_TicksToMSecs(OS_GetTicks()) - start;
+	int timeout;
+
+	if (elapsed >= total_ms)
+		return -1;
+	timeout = (int)(total_ms - elapsed);
+	if (timeout > XF16CAM_HTTP_TIMEOUT_MS)
+		timeout = XF16CAM_HTTP_TIMEOUT_MS;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+	return recv(fd, buffer, length, 0);
+}
+
+__attribute__((noinline))
+static int xf16cam_http_ota(int fd, char *body, int body_length, int content_length)
+{
+	int written = 0;
+	uint32_t upload_start;
+
+	if (content_length <= 0 || content_length > XF16CAM_OTA_MAX_SIZE) {
+		xf16cam_http_message(fd, "413 Payload Too Large", "Invalid OTA image size.");
+		return XF16CAM_HTTP_KEEP_RUNNING;
+	}
+	if (xf16cam_update_begin() != 0) {
+		xf16cam_http_message(fd, "409 Conflict", "Another firmware or settings update is active.");
+		return XF16CAM_HTTP_KEEP_RUNNING;
+	}
+	if (xf16cam_media_quiesce_for_update(XF16CAM_OTA_QUIESCE_MS) != 0) {
+		xf16cam_update_end();
+		xf16cam_http_message(fd, "503 Service Unavailable",
+		                     "Active media could not stop safely. Close stream clients and try again.");
+		return XF16CAM_HTTP_KEEP_RUNNING;
+	}
+	if (ota_push_init() != OTA_STATUS_OK || ota_push_start() != OTA_STATUS_OK)
+		goto fail;
+	upload_start = OS_TicksToMSecs(OS_GetTicks());
+	if (body_length > content_length)
+		body_length = content_length;
+	if (body_length > 0 && ota_push_data((uint8_t *)body, body_length) != OTA_STATUS_OK)
+		goto fail;
+	written = body_length;
+	while (written < content_length) {
+		int wanted = content_length - written;
+		int count;
+		if (wanted > (int)sizeof(g_request))
+			wanted = sizeof(g_request);
+		count = xf16cam_http_recv_deadline(fd, g_request, wanted, upload_start,
+		                                      XF16CAM_OTA_UPLOAD_MS);
+		if (count <= 0 || ota_push_data((uint8_t *)g_request, count) != OTA_STATUS_OK)
+			goto fail;
+		written += count;
+	}
+	if (ota_push_finish() != OTA_STATUS_OK)
+		goto fail;
+	{
+		static const char success[] = "Update verified. Rebooting...";
+		xf16cam_http_begin_length(fd, "200 OK", "text/plain; charset=utf-8", sizeof(success) - 1);
+		xf16cam_http_send_all(fd, success, sizeof(success) - 1);
+	}
+	return XF16CAM_HTTP_OTA_REBOOT;
+
+fail:
+	ota_push_stop();
+	xf16cam_update_end();
+	xf16cam_http_message(fd, "400 Bad Request", "OTA verification failed; the current firmware is unchanged.");
+	return XF16CAM_HTTP_KEEP_RUNNING;
+}
+
+__xip_text
+static int xf16cam_http_handle(int fd)
+{
+	char method[8];
+	char path[96];
+	char *header_end;
+	char *body;
+	int received = 0;
+	int content_length = 0;
+	uint32_t request_start = OS_TicksToMSecs(OS_GetTicks());
+	char ssid[XF16CAM_SSID_MAX_LEN + 1];
+	char psk[XF16CAM_PSK_MAX_LEN + 1];
+	char mode[16];
+
+	memset(g_request, 0, sizeof(g_request));
+	header_end = NULL;
+	while (received < (int)sizeof(g_request) - 1) {
+		int count = xf16cam_http_recv_deadline(fd, g_request + received,
+		                                         sizeof(g_request) - 1 - received,
+		                                         request_start, XF16CAM_HTTP_HEADER_MS);
+		if (count <= 0)
+			return 0;
+		received += count;
+		g_request[received] = '\0';
+		header_end = strstr(g_request, "\r\n\r\n");
+		if (header_end != NULL)
+			break;
+	}
+	if (sscanf(g_request, "%7s %95s", method, path) != 2) {
+		xf16cam_http_message(fd, "400 Bad Request", "Malformed request.");
+		return 0;
+	}
+	header_end = strstr(g_request, "\r\n\r\n");
+	if (header_end == NULL) {
+		xf16cam_http_message(fd, "431 Request Header Fields Too Large", "Request headers are too large.");
+		return XF16CAM_HTTP_KEEP_RUNNING;
+	}
+	body = header_end ? header_end + 4 : g_request + received;
+	if (xf16cam_http_content_length(g_request, header_end, &content_length) != 0) {
+		xf16cam_http_message(fd, "400 Bad Request", "Invalid Content-Length header.");
+		return XF16CAM_HTTP_KEEP_RUNNING;
+	}
+
+	if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ota") == 0)
+		return xf16cam_http_ota(fd, body, received - (body - g_request), content_length);
+
+	if (content_length > (int)(sizeof(g_request) - 1 - (body - g_request))) {
+		xf16cam_http_message(fd, "413 Payload Too Large", "Request body is too large.");
+		return XF16CAM_HTTP_KEEP_RUNNING;
+	}
+	while (received - (body - g_request) < content_length) {
+		int count = xf16cam_http_recv_deadline(fd, g_request + received,
+		                                         sizeof(g_request) - 1 - received,
+		                                         request_start, XF16CAM_HTTP_TIMEOUT_MS);
+		if (count <= 0)
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		received += count;
+		g_request[received] = '\0';
+	}
+	body[content_length] = '\0';
+
+	if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
+		xf16cam_http_page(fd);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/stream.mjpeg") == 0) {
+		if (!xf16cam_sensor_available())
+			xf16cam_http_message(fd, "503 Service Unavailable", "No supported camera sensor is available.");
+		else if (xf16cam_config_get()->media_mode != XF16CAM_MEDIA_WEB)
+			xf16cam_http_message(fd, "409 Conflict", "Browser video mode is not active.");
+		else if (xf16cam_mjpeg_start(fd) != 0)
+			xf16cam_http_message(fd, "503 Service Unavailable", "A browser video client is already active.");
+		else
+			return XF16CAM_HTTP_DETACH_CLIENT;
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/stream.pcmu") == 0) {
+		if (xf16cam_config_get()->media_mode != XF16CAM_MEDIA_WEB &&
+		    xf16cam_sensor_available())
+			xf16cam_http_message(fd, "409 Conflict", "Browser video mode is not active.");
+		else if (xf16cam_audio_http_start(fd) != 0)
+			xf16cam_http_message(fd, "503 Service Unavailable", "A browser audio client is already active.");
+		else
+			return XF16CAM_HTTP_DETACH_CLIENT;
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/scan") == 0) {
+		xf16cam_http_scan_json(fd);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/audio") == 0) {
+		xf16cam_http_audio_json(fd);
+	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/motion") == 0) {
+		const XF16CamConfig *config = xf16cam_config_get();
+		char response[192];
+		int length = snprintf(response, sizeof(response),
+		                      "{\"enabled\":%s,\"alarm\":%s,\"events\":%lu,\"active\":%s,\"age_ms\":%lu}",
+		                      XF16CAM_MOTION_ENABLED(config) ? "true" : "false",
+		                      XF16CAM_MOTION_ALARM_ENABLED(config) ? "true" : "false",
+		                      (unsigned long)xf16cam_board_motion_events(),
+		                      xf16cam_board_motion_active() ? "true" : "false",
+		                      (unsigned long)xf16cam_board_motion_age_ms());
+		xf16cam_http_begin_length(fd, "200 OK", "application/json", length);
+		xf16cam_http_send_all(fd, response, length);
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/power") == 0) {
+		xf16cam_http_power_json(fd);
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/wifi") == 0) {
+		int invalid = xf16cam_form_value(body, "ssid", ssid, sizeof(ssid)) != 0 ||
+		              xf16cam_form_value(body, "password", psk, sizeof(psk)) != 0;
+
+		if (!invalid) {
+			const XF16CamConfig *current = xf16cam_config_get();
+
+			/* A blank password for the currently saved secured SSID means
+			 * "unchanged". A different SSID with a blank password remains a
+			 * deliberate request to join an open network. */
+			if (psk[0] == '\0' && current->wifi_mode == XF16CAM_WIFI_STA &&
+			    current->psk[0] != '\0' && strcmp(ssid, current->ssid) == 0)
+				memcpy(psk, current->psk, sizeof(psk));
+			invalid = xf16cam_config_save_sta(ssid, psk) != 0;
+		}
+		if (invalid) {
+			xf16cam_http_message(fd, "400 Bad Request",
+			                     "Invalid SSID or password. WPA passwords must contain 8 to 63 characters.");
+			return 0;
+		}
+		if (xf16cam_update_begin() != 0) {
+			xf16cam_http_message(fd, "409 Conflict",
+			                     "Settings were saved, but reboot was deferred by another update.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "Settings saved. Rebooting into station mode...");
+		return XF16CAM_HTTP_COLD_REBOOT;
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ap") == 0) {
+		if (xf16cam_config_save_ap() != 0) {
+			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save open AP mode.");
+			return 0;
+		}
+		if (xf16cam_update_begin() != 0) {
+			xf16cam_http_message(fd, "409 Conflict",
+			                     "Open AP was saved, but reboot was deferred by another update.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "Open AP restored. Rebooting...");
+		return XF16CAM_HTTP_COLD_REBOOT;
+
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/light") == 0) {
+		uint8_t enabled = XF16CAM_LIGHT_ENABLED(xf16cam_config_get()) ? 1U : 0U;
+		uint8_t stronger = XF16CAM_LIGHT_STRONGER(xf16cam_config_get()) ? 1U : 0U;
+		uint8_t daynight = XF16CAM_AUTO_DAY_NIGHT(xf16cam_config_get()) ? 1U : 0U;
+		int setting = 0;
+		int valid = 0;
+
+		if (xf16cam_form_value(body, "light", mode, sizeof(mode)) == 0) {
+			setting = 1;
+			if (strcmp(mode, "enabled") == 0) {
+				enabled = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				enabled = 0;
+				valid = 1;
+			}
+		} else if (xf16cam_form_value(body, "intensity", mode, sizeof(mode)) == 0) {
+			setting = 2;
+			if (strcmp(mode, "stronger") == 0) {
+				stronger = 1;
+				valid = 1;
+			} else if (strcmp(mode, "weaker") == 0) {
+				stronger = 0;
+				valid = 1;
+			}
+		} else if (xf16cam_form_value(body, "daynight", mode, sizeof(mode)) == 0) {
+			setting = 3;
+			if (strcmp(mode, "enabled") == 0) {
+				daynight = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				daynight = 0;
+				valid = 1;
+			}
+		}
+		if (!valid) {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid light setting.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (setting != 3 && XF16CAM_AUTO_DAY_NIGHT(xf16cam_config_get())) {
+			xf16cam_http_message(fd, "409 Conflict",
+			                     "Manual light controls are locked while automatic day/night is enabled.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if ((setting == 3 && xf16cam_config_save_daynight(daynight) != 0) ||
+		    (setting != 3 && xf16cam_config_save_light(enabled, stronger) != 0)) {
+			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save light settings to flash.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (setting == 3 && !daynight)
+			xf16cam_board_set_ir_led(0);
+		xf16cam_light_apply();
+		xf16cam_http_message(fd, "200 OK", "Light settings saved and applied. Return to the panel to view the current state.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/motion") == 0) {
+		uint8_t enabled = 0;
+		int setting = 0;
+		int valid = 0;
+
+		if (xf16cam_form_value(body, "motion", mode, sizeof(mode)) == 0) {
+			setting = 1;
+			if (strcmp(mode, "enabled") == 0) {
+				enabled = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				enabled = 0;
+				valid = 1;
+			}
+		} else if (xf16cam_form_value(body, "alarm", mode, sizeof(mode)) == 0) {
+			setting = 2;
+			if (strcmp(mode, "enabled") == 0) {
+				enabled = 1;
+				valid = 1;
+			} else if (strcmp(mode, "disabled") == 0) {
+				enabled = 0;
+				valid = 1;
+			}
+		}
+		if (!valid) {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid motion setting.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if ((setting == 1 && xf16cam_config_save_motion(enabled) != 0) ||
+		    (setting == 2 && xf16cam_config_save_motion_alarm(enabled) != 0)) {
+			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save motion settings to flash.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (setting == 1 && !enabled)
+			xf16cam_motion_reset();
+		xf16cam_http_message(fd, "200 OK", "Motion settings saved. Return to the panel to see updated status.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ptz") == 0) {
+		char action[12];
+		int direction = 0;
+
+		if (xf16cam_form_value(body, "mode", mode, sizeof(mode)) != 0) {
+			xf16cam_http_message(fd, "400 Bad Request", "Missing PTZ direction.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (strcmp(mode, "left") == 0)
+			direction = XF16CAM_PTZ_LEFT;
+		else if (strcmp(mode, "right") == 0)
+			direction = XF16CAM_PTZ_RIGHT;
+		else if (strcmp(mode, "up") == 0)
+			direction = XF16CAM_PTZ_UP;
+		else if (strcmp(mode, "down") == 0)
+			direction = XF16CAM_PTZ_DOWN;
+		else {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid PTZ direction.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+
+		if (xf16cam_form_value(body, "action", action, sizeof(action)) != 0 ||
+		    strcmp(action, "step") == 0) {
+			if (direction == XF16CAM_PTZ_LEFT)
+				ptz_move_left();
+			else if (direction == XF16CAM_PTZ_RIGHT)
+				ptz_move_right();
+			else if (direction == XF16CAM_PTZ_UP)
+				ptz_move_up();
+			else
+				ptz_move_down();
+		} else if (strcmp(action, "start") == 0) {
+			if (xf16cam_ptz_start(direction) != 0) {
+				xf16cam_http_message(fd, "503 Service Unavailable", "PTZ movement task unavailable.");
+				return XF16CAM_HTTP_KEEP_RUNNING;
+			}
+		} else if (strcmp(action, "stop") == 0) {
+			xf16cam_ptz_stop();
+		} else {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid PTZ action.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "PTZ command accepted.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/media") == 0) {
+		XF16CamMediaMode media_mode;
+
+		if (xf16cam_form_value(body, "mode", mode, sizeof(mode)) != 0) {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid camera mode.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (strcmp(mode, "web") == 0)
+			media_mode = XF16CAM_MEDIA_WEB;
+		else if (strcmp(mode, "rtsp") == 0)
+			media_mode = XF16CAM_MEDIA_RTSP;
+		else {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid camera mode.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (xf16cam_config_save_media_and_begin_update(media_mode) != 0) {
+			xf16cam_http_message(fd, "409 Conflict",
+			                     "Camera mode could not be saved or another operation is already in progress.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "Camera mode saved. Rebooting...");
+		return XF16CAM_HTTP_COLD_REBOOT;
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/resolution") == 0) {
+		XF16CamResolution resolution;
+
+		if (xf16cam_form_value(body, "resolution", mode, sizeof(mode)) != 0 ||
+		    (strcmp(mode, "qvga") != 0 && strcmp(mode, "vga") != 0)) {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid camera resolution.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		resolution = strcmp(mode, "vga") == 0 ? XF16CAM_RESOLUTION_VGA :
+		                                              XF16CAM_RESOLUTION_QVGA;
+		if (resolution == XF16CAM_RESOLUTION_VGA && !xf16cam_sensor_supports_vga()) {
+			xf16cam_http_message(fd, "409 Conflict", "The detected sensor does not support VGA output.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (xf16cam_config_save_resolution(resolution) != 0) {
+			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save camera resolution.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (xf16cam_update_begin() != 0) {
+			xf16cam_http_message(fd, "409 Conflict",
+			                     "Camera resolution was saved, but reboot was deferred by another update.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "Camera resolution saved. Rebooting...");
+		return XF16CAM_HTTP_COLD_REBOOT;
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sd/refresh") == 0) {
+		if (xf16cam_storage_refresh() != 0)
+			xf16cam_http_message(fd, "503 Service Unavailable", "No readable FAT SD card was found.");
+		else
+			xf16cam_http_message(fd, "200 OK", "SD card mounted. Return to the main page for capacity details.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sd/eject") == 0) {
+		if (xf16cam_storage_unmount() != 0)
+			xf16cam_http_message(fd, "500 Internal Server Error", "SD card eject failed.");
+		else
+			xf16cam_http_message(fd, "200 OK", "SD card safely ejected.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sd/format") == 0) {
+		if (xf16cam_storage_format() != 0)
+			xf16cam_http_message(fd, "500 Internal Server Error", "SD card formatting failed.");
+		else
+			xf16cam_http_message(fd, "200 OK", "SD card formatted as FAT32.");
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/hibernate") == 0) {
+		if (xf16cam_update_begin() != 0) {
+			xf16cam_http_message(fd, "409 Conflict", "Device is busy.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (xf16cam_media_quiesce_for_update(XF16CAM_OTA_QUIESCE_MS) != 0) {
+			xf16cam_update_end();
+			xf16cam_http_message(fd, "503 Service Unavailable",
+			                     "Active media could not stop safely. Close stream clients and try again.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "Hibernating; press PA20 to wake.");
+		return XF16CAM_HTTP_HIBERNATE;
+	} else {
+		xf16cam_http_message(fd, "404 Not Found", "Page not found.");
+	}
+	return 0;
+}
+
+static void xf16cam_http_task(void *arg)
+{
+	int server = (int)(intptr_t)arg;
+
+	printf("xf16cam HTTP ready: http://%s/\n", xf16cam_net_ip());
+	while (1) {
+		int client = accept(server, NULL, NULL);
+		int action;
+		if (client < 0)
+			continue;
+		setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &((int){XF16CAM_HTTP_TIMEOUT_MS}), sizeof(int));
+		setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &((int){XF16CAM_HTTP_TIMEOUT_MS}), sizeof(int));
+		action = xf16cam_http_handle(client);
+		if (action == XF16CAM_HTTP_DETACH_CLIENT)
+			continue;
+		closesocket(client);
+		if (action != XF16CAM_HTTP_KEEP_RUNNING) {
+			OS_MSleep(750);
+			/* All HTTP-triggered restarts pass through this task. Unmount here,
+			 * after the response has reached the client, so configuration, media
+			 * mode and OTA restarts cannot leave a mounted card dirty. */
+			if (xf16cam_storage_unmount() != 0)
+				printf("xf16cam HTTP: SD eject failed before restart\n");
+			if (action == XF16CAM_HTTP_OTA_REBOOT)
+				ota_reboot();
+			if (action == XF16CAM_HTTP_HIBERNATE) {
+				xf16cam_power_hibernate();
+				xf16cam_update_end();
+				continue;
+			}
+			HAL_PRCM_SetCPUABootFlag(PRCM_CPUA_BOOT_FROM_COLD_RESET);
+			HAL_WDG_Reboot();
+		}
+	}
+
+	closesocket(server);
+	printf("xf16cam HTTP server failed\n");
+	OS_ThreadDelete(&g_http_thread);
+}
+
+__xip_text
+int xf16cam_http_start(void)
+{
+	struct sockaddr_in address;
+	int option = 1;
+	int server;
+
+	/* Query the immutable identity once while executing from SRAM. The page
+	 * renderer lives in XIP and must never disable the flash containing it. */
+	xf16cam_http_flash_info(&g_flash_jedec, &g_flash_size);
+	server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+
+	if (server < 0)
+		goto fail;
+	setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+	memset(&address, 0, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_port = htons(XF16CAM_HTTP_PORT);
+	address.sin_addr.s_addr = INADDR_ANY;
+	if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+	    listen(server, 2) != 0)
+		goto fail_close;
+	if (OS_ThreadCreate(&g_http_thread, "xf16cam-http", xf16cam_http_task,
+	                    (void *)(intptr_t)server, OS_THREAD_PRIO_APP,
+	                    XF16CAM_HTTP_STACK_SIZE) != OS_OK)
+		goto fail_close;
+	return 0;
+
+fail_close:
+	closesocket(server);
+fail:
+	printf("xf16cam HTTP start failed\n");
+	return -1;
+}
