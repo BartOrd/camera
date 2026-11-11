@@ -548,6 +548,20 @@ static int xf16cam_capture_jpeg(CAMERA_JpegBuffInfo *info, uint8_t **jpeg,
 	}
 	return 0;
 }
+static int xf16cam_capture_jpeg_serialized(CAMERA_JpegBuffInfo *info,
+					   uint8_t **jpeg, uint32_t *jpeg_len)
+{
+	int result;
+
+	if (!g_capture_lock_ready)
+		return xf16cam_capture_jpeg(info, jpeg, jpeg_len);
+	if (OS_MutexLock(&g_capture_lock, OS_WAIT_FOREVER) != OS_OK)
+		return -1;
+	result = xf16cam_capture_jpeg(info, jpeg, jpeg_len);
+	OS_MutexUnlock(&g_capture_lock);
+	return result;
+}
+
 static void xf16cam_motion_monitor_task(void *arg)
 {
 	int camera_acquired = 0;
@@ -632,7 +646,7 @@ static int xf16cam_mjpeg_stream(int fd)
 		int capture;
 		int length;
 
-		capture = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
+		capture = xf16cam_capture_jpeg_serialized(&info, &jpeg, &jpeg_len);
 		if (capture < 0)
 			break;
 		if (capture > 0)
@@ -1079,7 +1093,7 @@ static int xf16cam_stream_client(int fd, const char *ip)
 				goto stopped;
 		}
 
-		capture = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
+		capture = xf16cam_capture_jpeg_serialized(&info, &jpeg, &jpeg_len);
 		if (capture < 0)
 			break;
 		if (capture > 0)
