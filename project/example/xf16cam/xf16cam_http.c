@@ -370,19 +370,27 @@ static void xf16cam_http_page(int fd)
 	                  (unsigned long)media->largest_jpeg,
 	                  (unsigned long)media->capture_errors);
 	xf16cam_http_send_all(fd, dynamic, length);
-	if (xf16cam_sensor_supports_vga()) {
+	if (xf16cam_sensor_supports_vga() || xf16cam_sensor_supports_720p()) {
 		if (xf16cam_sensor_width() == 640)
 			XF16CAM_HTTP_SEND_LITERAL(fd,
 			                  "<form method=post action=/api/resolution>"
 			                  "<button name=resolution value=qvga>320x240</button> "
-			                  "<button disabled>640x480 (active)</button></form>");
+			                  "<button disabled>640x480 (active)</button>");
 		else
 			XF16CAM_HTTP_SEND_LITERAL(fd,
 			                  "<form method=post action=/api/resolution>"
 			                  "<button disabled>320x240 (active)</button> "
-			                  "<button name=resolution value=vga>640x480</button></form>");
+			                  "<button name=resolution value=vga>640x480</button>");
+		if (xf16cam_sensor_supports_720p()) {
+			if (xf16cam_sensor_width() == 1280)
+				XF16CAM_HTTP_SEND_LITERAL(fd,
+				                  " <button disabled>1280x720 (active)</button>");
+			else
+				XF16CAM_HTTP_SEND_LITERAL(fd,
+				                  " <button name=resolution value=720p>1280x720</button>");
+		}
 		XF16CAM_HTTP_SEND_LITERAL(fd,
-		                  "<small>Changing resolution reboots. VGA uses more bandwidth and may reduce frame rate.</small>");
+			                  "</form><small>Changing resolution reboots. Higher resolutions use more memory and bandwidth.</small>");
 	}
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "</section><section class=card><h2>Audio</h2><div class=grid><b>Microphone</b><span>");
@@ -1113,14 +1121,17 @@ static int xf16cam_http_handle(int fd)
 		XF16CamResolution resolution;
 
 		if (xf16cam_form_value(body, "resolution", mode, sizeof(mode)) != 0 ||
-		    (strcmp(mode, "qvga") != 0 && strcmp(mode, "vga") != 0)) {
+		    (strcmp(mode, "qvga") != 0 && strcmp(mode, "vga") != 0 &&
+		     strcmp(mode, "720p") != 0)) {
 			xf16cam_http_message(fd, "400 Bad Request", "Invalid camera resolution.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
-		resolution = strcmp(mode, "vga") == 0 ? XF16CAM_RESOLUTION_VGA :
-		                                              XF16CAM_RESOLUTION_QVGA;
-		if (resolution == XF16CAM_RESOLUTION_VGA && !xf16cam_sensor_supports_vga()) {
-			xf16cam_http_message(fd, "409 Conflict", "The detected sensor does not support VGA output.");
+		resolution = strcmp(mode, "720p") == 0 ? XF16CAM_RESOLUTION_720P :
+		             strcmp(mode, "vga") == 0 ? XF16CAM_RESOLUTION_VGA :
+		                                            XF16CAM_RESOLUTION_QVGA;
+		if ((resolution == XF16CAM_RESOLUTION_VGA && !xf16cam_sensor_supports_vga()) ||
+		    (resolution == XF16CAM_RESOLUTION_720P && !xf16cam_sensor_supports_720p())) {
+			xf16cam_http_message(fd, "409 Conflict", "The detected sensor does not support this resolution.");
 			return XF16CAM_HTTP_KEEP_RUNNING;
 		}
 		if (xf16cam_config_save_resolution(resolution) != 0) {
