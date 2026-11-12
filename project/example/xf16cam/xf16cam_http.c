@@ -371,26 +371,26 @@ static void xf16cam_http_page(int fd)
 	                  (unsigned long)media->capture_errors);
 	xf16cam_http_send_all(fd, dynamic, length);
 	if (xf16cam_sensor_supports_vga() || xf16cam_sensor_supports_720p()) {
-		if (xf16cam_sensor_width() == 640)
-			XF16CAM_HTTP_SEND_LITERAL(fd,
-			                  "<form method=post action=/api/resolution>"
-			                  "<button name=resolution value=qvga>320x240</button> "
-			                  "<button disabled>640x480 (active)</button>");
-		else
-			XF16CAM_HTTP_SEND_LITERAL(fd,
-			                  "<form method=post action=/api/resolution>"
-			                  "<button disabled>320x240 (active)</button> "
-			                  "<button name=resolution value=vga>640x480</button>");
+		XF16CAM_HTTP_SEND_LITERAL(fd,
+		                  "<form method=post action=/api/resolution>");
+		if (xf16cam_sensor_supports_vga()) {
+			if (xf16cam_sensor_width() == 320)
+				XF16CAM_HTTP_SEND_LITERAL(fd, "<button disabled>320x240 (active)</button> ");
+			else
+				XF16CAM_HTTP_SEND_LITERAL(fd, "<button name=resolution value=qvga>320x240</button> ");
+			if (xf16cam_sensor_width() == 640)
+				XF16CAM_HTTP_SEND_LITERAL(fd, "<button disabled>640x480 (active)</button> ");
+			else
+				XF16CAM_HTTP_SEND_LITERAL(fd, "<button name=resolution value=vga>640x480</button> ");
+		}
 		if (xf16cam_sensor_supports_720p()) {
 			if (xf16cam_sensor_width() == 1280)
-				XF16CAM_HTTP_SEND_LITERAL(fd,
-				                  " <button disabled>1280x720 (active)</button>");
+				XF16CAM_HTTP_SEND_LITERAL(fd, "<button disabled>1280x720 (active)</button>");
 			else
-				XF16CAM_HTTP_SEND_LITERAL(fd,
-				                  " <button name=resolution value=720p>1280x720</button>");
+				XF16CAM_HTTP_SEND_LITERAL(fd, "<button name=resolution value=720p>1280x720</button>");
 		}
 		XF16CAM_HTTP_SEND_LITERAL(fd,
-			                  "</form><small>Changing resolution reboots. Higher resolutions use more memory and bandwidth.</small>");
+		                  "</form><small>Changing resolution reboots. Higher resolutions use more memory and bandwidth.</small>");
 	}
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "</section><section class=card><h2>Audio</h2><div class=grid><b>Microphone</b><span>");
