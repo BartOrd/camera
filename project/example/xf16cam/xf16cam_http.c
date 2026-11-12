@@ -283,6 +283,13 @@ static void xf16cam_http_page(int fd)
 	char camera_detail[48];
 	char camera_output[24];
 	char dynamic[640];
+	char id_summary[96];
+	const XF16CamSensorDiagnostic *diagnostic;
+	const char *probe_status;
+	const char *override_name;
+	unsigned int diagnostic_index;
+	unsigned int id_index;
+	int id_used;
 	int length;
 
 	if (camera_available) {
@@ -393,7 +400,99 @@ static void xf16cam_http_page(int fd)
 		                  "</form><small>Changing resolution reboots. Higher resolutions use more memory and bandwidth.</small>");
 	}
 	XF16CAM_HTTP_SEND_LITERAL(fd,
-	                  "</section><section class=card><h2>Audio</h2><div class=grid><b>Microphone</b><span>");
+	                  "</section><section class='card wide'><h2>Sensor diagnostics</h2>"
+	                  "<div class=grid><b>Selection mode</b><span>");
+	switch (xf16cam_sensor_override_mode()) {
+	case XF16CAM_SENSOR_FORCE_GC0311:
+		override_name = "Forced GC0311";
+		break;
+	case XF16CAM_SENSOR_FORCE_GC2145:
+		override_name = "Forced GC2145";
+		break;
+	default:
+		override_name = "Automatic detection";
+		break;
+	}
+	xf16cam_http_send_text(fd, override_name);
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Detected/selected</b><span>");
+	xf16cam_http_send_text(fd, xf16cam_sensor_name());
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></div><div class=grid>");
+	for (diagnostic_index = 0;
+	     diagnostic_index < xf16cam_sensor_diagnostic_count();
+	     ++diagnostic_index) {
+		diagnostic = xf16cam_sensor_diagnostic((uint8_t)diagnostic_index);
+		if (!diagnostic)
+			continue;
+		switch (diagnostic->status) {
+		case XF16CAM_SENSOR_PROBE_MATCH:
+			probe_status = "ID match";
+			break;
+		case XF16CAM_SENSOR_PROBE_ID_MISMATCH:
+			probe_status = "ID mismatch";
+			break;
+		case XF16CAM_SENSOR_PROBE_IO_ERROR:
+			probe_status = "I2C read/write error";
+			break;
+		case XF16CAM_SENSOR_PROBE_TABLE_ERROR:
+			probe_status = "probe table write error";
+			break;
+		default:
+			probe_status = "not tested";
+			break;
+		}
+		id_summary[0] = '\0';
+		id_used = 0;
+		for (id_index = 0; id_index < diagnostic->id_count && id_index < 2; ++id_index) {
+			if (diagnostic->read_ok[id_index]) {
+				id_used += snprintf(id_summary + id_used,
+				                    sizeof(id_summary) - id_used,
+				                    "%s%02X=%02X (expected %02X)",
+				                    id_index ? ", " : "",
+				                    diagnostic->id_register[id_index],
+				                    diagnostic->actual_id[id_index],
+				                    diagnostic->expected_id[id_index]);
+			} else {
+				id_used += snprintf(id_summary + id_used,
+				                    sizeof(id_summary) - id_used,
+				                    "%s%02X=ERR (expected %02X)",
+				                    id_index ? ", " : "",
+				                    diagnostic->id_register[id_index],
+				                    diagnostic->expected_id[id_index]);
+			}
+			if (id_used >= (int)sizeof(id_summary)) {
+				id_summary[sizeof(id_summary) - 1] = '\0';
+				break;
+			}
+		}
+		length = snprintf(dynamic, sizeof(dynamic),
+		                  "<b>%s @0x%02X%s</b><span>%s · attempts=%u · %s</span>",
+		                  diagnostic->name, diagnostic->address,
+		                  diagnostic->selected ? " (selected)" : "",
+		                  probe_status, (unsigned int)diagnostic->attempts,
+		                  id_summary[0] ? id_summary : "No ID registers");
+		if (length > 0 && length < (int)sizeof(dynamic))
+			xf16cam_http_send_all(fd, dynamic, length);
+	}
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</div><form method=post action=/api/sensor><select name=sensor>");
+	if (xf16cam_sensor_override_mode() == XF16CAM_SENSOR_AUTO)
+		XF16CAM_HTTP_SEND_LITERAL(fd, "<option value=auto selected>Automatic detection</option>");
+	else
+		XF16CAM_HTTP_SEND_LITERAL(fd, "<option value=auto>Automatic detection</option>");
+	if (xf16cam_sensor_override_mode() == XF16CAM_SENSOR_FORCE_GC0311)
+		XF16CAM_HTTP_SEND_LITERAL(fd, "<option value=gc0311 selected>Force GC0311</option>");
+	else
+		XF16CAM_HTTP_SEND_LITERAL(fd, "<option value=gc0311>Force GC0311</option>");
+	if (xf16cam_sensor_override_mode() == XF16CAM_SENSOR_FORCE_GC2145)
+		XF16CAM_HTTP_SEND_LITERAL(fd, "<option value=gc2145 selected>Force GC2145</option>");
+	else
+		XF16CAM_HTTP_SEND_LITERAL(fd, "<option value=gc2145>Force GC2145</option>");
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</select> <button type=submit>Apply and reboot</button></form>"
+	                  "<small>Forced mode applies the selected sensor register table even when the chip ID does not match. "
+	                  "Use only for testing; choose Automatic detection to restore normal scanning. "
+	                  "The scan stops after the first automatic match.</small></section>"
+	                  "<section class=card><h2>Audio</h2><div class=grid><b>Microphone</b><span>");
 	length = snprintf(dynamic, sizeof(dynamic),
 	                  "%s</span><b>Peak level</b><span><span id=mic>%u</span>/32768</span></div></section></div>",
 	                  !audio->available ? "AMIC unavailable" :
@@ -999,6 +1098,34 @@ static int xf16cam_http_handle(int fd)
 		xf16cam_http_message(fd, "200 OK", "Open AP restored. Rebooting...");
 		return XF16CAM_HTTP_COLD_REBOOT;
 
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/sensor") == 0) {
+		XF16CamSensorOverride sensor_override;
+
+		if (xf16cam_form_value(body, "sensor", mode, sizeof(mode)) != 0) {
+			xf16cam_http_message(fd, "400 Bad Request", "Missing sensor profile.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (strcmp(mode, "auto") == 0)
+			sensor_override = XF16CAM_SENSOR_AUTO;
+		else if (strcmp(mode, "gc0311") == 0)
+			sensor_override = XF16CAM_SENSOR_FORCE_GC0311;
+		else if (strcmp(mode, "gc2145") == 0)
+			sensor_override = XF16CAM_SENSOR_FORCE_GC2145;
+		else {
+			xf16cam_http_message(fd, "400 Bad Request", "Invalid sensor profile.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (xf16cam_config_save_sensor_override(sensor_override) != 0) {
+			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save sensor selection.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		if (xf16cam_update_begin() != 0) {
+			xf16cam_http_message(fd, "409 Conflict",
+			                     "Sensor selection was saved, but reboot was deferred by another update.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		xf16cam_http_message(fd, "200 OK", "Sensor profile saved. Rebooting...");
+		return XF16CAM_HTTP_COLD_REBOOT;
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/light") == 0) {
 		uint8_t enabled = XF16CAM_LIGHT_ENABLED(xf16cam_config_get()) ? 1U : 0U;
 		uint8_t stronger = XF16CAM_LIGHT_STRONGER(xf16cam_config_get()) ? 1U : 0U;
