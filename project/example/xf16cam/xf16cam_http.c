@@ -405,8 +405,6 @@ static void xf16cam_http_page(int fd)
 	xf16cam_http_send_text(fd, xf16cam_board_ir_led_on() ? "On (PA22)" : "Off (PA22)");
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "</span></span></div><form method=post action=/api/light>"
-	XF16CAM_HTTP_SEND_LITERAL(fd,
-	                  "</span></span></div><form method=post action=/api/light>"
 	                  "<button class=manual-light data-active=");
 	xf16cam_http_send_text(fd, XF16CAM_LIGHT_ENABLED(config) ? "0" : "1");
 	XF16CAM_HTTP_SEND_LITERAL(fd, " type=submit onclick='lightSubmit(this);return false' name=light value=disabled");
