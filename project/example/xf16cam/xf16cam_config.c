@@ -101,7 +101,7 @@ int xf16cam_config_init(void)
 	    (config->schema != XF16CAM_CONFIG_SCHEMA_LEGACY &&
 	     config->schema != 2U && config->schema != XF16CAM_CONFIG_SCHEMA) ||
 	    (config->schema != XF16CAM_CONFIG_SCHEMA_LEGACY &&
-	     config->resolution > XF16CAM_RESOLUTION_VGA)) {
+	     config->resolution > XF16CAM_RESOLUTION_720P)) {
 		xf16cam_config_defaults(config);
 		printf("xf16cam config: using defaults (AP mode)\n");
 		return 0;
@@ -125,6 +125,7 @@ int xf16cam_config_init(void)
 	       config->schema,
 	       config->wifi_mode == XF16CAM_WIFI_STA ? "STA" : "AP",
 	       config->media_mode == XF16CAM_MEDIA_WEB ? "WEB" : "RTSP",
+	       config->resolution == XF16CAM_RESOLUTION_720P ? "720P" :
 	       config->resolution == XF16CAM_RESOLUTION_VGA ? "VGA" : "QVGA",
 	       config->ssid);
 	return 0;
@@ -249,7 +250,8 @@ int xf16cam_config_save_resolution(XF16CamResolution resolution)
 	int result;
 
 	if (resolution != XF16CAM_RESOLUTION_QVGA &&
-	    resolution != XF16CAM_RESOLUTION_VGA)
+	    resolution != XF16CAM_RESOLUTION_VGA &&
+	    resolution != XF16CAM_RESOLUTION_720P)
 		return -1;
 	if (!g_config_lock_ready || OS_MutexLock(&g_config_lock, OS_WAIT_FOREVER) != OS_OK)
 		return -1;
