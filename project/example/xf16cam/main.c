@@ -604,7 +604,7 @@ static void xf16cam_motion_monitor_task(void *arg)
 				capture_result = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
 				OS_MutexUnlock(&g_capture_lock);
 				if (capture_result < 0) {
-					printf("xf16cam motion monitor: camera capture failed; reinitializing\\n");
+					printf("xf16cam motion monitor: camera capture failed; reinitializing\n");
 					xf16cam_camera_release();
 					camera_acquired = 0;
 					g_motion_monitor_camera = 0;
