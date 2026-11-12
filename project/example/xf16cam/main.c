@@ -38,10 +38,11 @@
 #define JPEG_ONLINE_EN           (1)
 #define JPEG_BUFFER_COUNT_MAX    (3)
 #define JPEG_MPART_EN            (0)
-#define JPEG_BUFF_SIZE           (100 * 1024)
-#define JPEG_SEND_BUFFER_SIZE    (JPEG_BUFF_SIZE + CAMERA_JPEG_HEADER_LEN)
+#define JPEG_DEFAULT_BUFF_SIZE   (100U * 1024U)
+#define JPEG_720P_BUFF_SIZE       (256U * 1024U)
+#define JPEG_SEND_BUFFER_SIZE    (g_jpeg_capacity + CAMERA_JPEG_HEADER_LEN)
 #define JPEG_BUFFER_ARENA_SIZE(count) \
-	((count) * (JPEG_BUFF_SIZE + CAMERA_JPEG_HEADER_LEN + 1023U))
+	((count) * (g_jpeg_capacity + CAMERA_JPEG_HEADER_LEN + 1023U))
 #define JPEG_IMAGE_WIDTH         (320)
 #define JPEG_IMAGE_HEIGHT        (240)
 #define XF16CAM_RTSP_PORT        (8554)
@@ -84,8 +85,9 @@ static uint32_t g_camera_users;
 static OS_Thread_t g_mjpeg_thread;
 static volatile int g_mjpeg_active;
 static volatile int g_rtsp_active;
+static uint32_t g_jpeg_capacity = JPEG_DEFAULT_BUFF_SIZE;
 static XF16CamMediaInfo g_media_info = {
-	.jpeg_capacity = JPEG_BUFF_SIZE,
+	.jpeg_capacity = JPEG_DEFAULT_BUFF_SIZE,
 };
 
 static CAMERA_Cfg camera_cfg = {
@@ -190,8 +192,8 @@ static int camera_mem_create(CAMERA_JpegCfg *jpeg_cfg, CAMERA_Mgmt *mgmt)
 	for (i = 0; i < count; i++) {
 		mgmt->jpeg_buf[i].addr =
 			(uint8_t *)ALIGN_1K((uint32_t)cursor + CAMERA_JPEG_HEADER_LEN);
-		mgmt->jpeg_buf[i].size = JPEG_BUFF_SIZE;
-		cursor = mgmt->jpeg_buf[i].addr + JPEG_BUFF_SIZE;
+		mgmt->jpeg_buf[i].size = g_jpeg_capacity;
+		cursor = mgmt->jpeg_buf[i].addr + g_jpeg_capacity;
 		if (cursor > end_addr) {
 			printf("jpeg buffer %lu exceeds capture arena\n", (unsigned long)i);
 			free(addr);
@@ -209,7 +211,7 @@ static int camera_mem_create(CAMERA_JpegCfg *jpeg_cfg, CAMERA_Mgmt *mgmt)
 	}
 	g_jpeg_buffer_count = (uint8_t)count;
 	printf("xf16cam buffers: count=%u bytes_each=%u send_copy=%s arena=%lu\n",
-	       (unsigned int)g_jpeg_buffer_count, JPEG_BUFF_SIZE,
+	       (unsigned int)g_jpeg_buffer_count, g_jpeg_capacity,
 	       g_jpeg_send_buffer != NULL ? "yes" : "no",
 	       (unsigned long)arena_size);
 
@@ -241,8 +243,13 @@ static int camera_init(void)
 {
 	const XF16CamConfig *config = xf16cam_config_get();
 
-	camera_cfg.jpeg_cfg.width = config->resolution == XF16CAM_RESOLUTION_VGA ? 640 : 320;
-	camera_cfg.jpeg_cfg.height = config->resolution == XF16CAM_RESOLUTION_VGA ? 480 : 240;
+	camera_cfg.jpeg_cfg.width = config->resolution == XF16CAM_RESOLUTION_720P ? 1280 :
+	                            config->resolution == XF16CAM_RESOLUTION_VGA ? 640 : 320;
+	camera_cfg.jpeg_cfg.height = config->resolution == XF16CAM_RESOLUTION_720P ? 720 :
+	                             config->resolution == XF16CAM_RESOLUTION_VGA ? 480 : 240;
+	g_jpeg_capacity = config->resolution == XF16CAM_RESOLUTION_720P ?
+	                  JPEG_720P_BUFF_SIZE : JPEG_DEFAULT_BUFF_SIZE;
+	g_media_info.jpeg_capacity = g_jpeg_capacity;
 	memset(&mem_mgmt, 0, sizeof(mem_mgmt));
 	if (camera_mem_create(&camera_cfg.jpeg_cfg, &mem_mgmt) != 0)
 		return -1;
