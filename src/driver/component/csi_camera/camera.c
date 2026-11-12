@@ -47,7 +47,8 @@ typedef struct {
 	uint32_t encode_len;
 	OS_Mutex_t lock;
 	OS_Semaphore_t sem;
-	uint8_t    sem_wait;
+	volatile uint8_t sem_wait;
+	volatile uint8_t capture_error;
 	CAMERA_Mgmt *mem_mgmt;
 	SENSOR_Func sensor_func;
 	SENSOR_ConfigParam sensor_param;
@@ -143,46 +144,77 @@ static void CAMERA_CsiJpegIrq(CSI_JPEG_IRQEvent event, void *arg)
 		HAL_JPEG_Reset();
 		HAL_JPEG_Config(&gJpegParam);
 		HAL_CSI_Config(&gCsiParam);
+		priv->capture_error = 1;
+		release = 1;
 	}
 	if (priv->cb)
 		priv->cb(status, info);
 
 	if (release && priv->sem_wait) {
-		OS_SemaphoreRelease(&priv->sem);
 		priv->sem_wait = 0;
+		OS_SemaphoreRelease(&priv->sem);
 	}
 }
 
-static int CAMERA_GetImage(CAMERA_OutFmt fmt, CAMERA_JpegBuffInfo *info, uint8_t restart, uint32_t timeout_ms)
+static void CAMERA_CaptureWaitPrepare(CAMERA_Private *priv)
+{
+	priv->sem_wait = 0;
+	(void)OS_SemaphoreWait(&priv->sem, 0);
+	priv->capture_error = 0;
+	priv->sem_wait = 1;
+}
+
+static void CAMERA_CaptureWaitCancel(CAMERA_Private *priv)
+{
+	priv->sem_wait = 0;
+	(void)OS_SemaphoreWait(&priv->sem, 0);
+}
+
+static int CAMERA_CaptureWait(CAMERA_Private *priv, uint32_t timeout_ms)
+{
+	if (OS_SemaphoreWait(&priv->sem, timeout_ms) != OS_OK)
+		return -1;
+	return priv->capture_error ? -1 : 0;
+}
+
+static int CAMERA_GetImage(CAMERA_OutFmt fmt, CAMERA_JpegBuffInfo *info,
+			   uint8_t restart, uint32_t timeout_ms)
 {
 	CAMERA_Private *priv = CAMERA_GetPriv();
-
-	int len = gJpegParam.pic_size_width*gJpegParam.pic_size_height*3/2;
+	int len = gJpegParam.pic_size_width * gJpegParam.pic_size_height * 3 / 2;
 
 	if (!restart) {
 		if (fmt == CAMERA_OUT_JPEG) {
 			info->buff_index = priv->encode_buff_id;
 			info->size = priv->encode_len;
 			return 0;
-		} else if (fmt == CAMERA_OUT_YUV420)
+		} else if (fmt == CAMERA_OUT_YUV420) {
 			return len;
+		}
 	}
 
+	priv->out_fmt = fmt;
+	CAMERA_CaptureWaitPrepare(priv);
 	if (HAL_CSI_StartCapture(CSI_CAP_STILL) != HAL_OK) {
+		CAMERA_CaptureWaitCancel(priv);
 		CAMERA_ERR("start cap still mode fail\n");
 		return -1;
 	}
 
-	priv->out_fmt = fmt;
-	priv->sem_wait = 1;
-	if (OS_SemaphoreWait(&priv->sem, timeout_ms) != OS_OK) {
-		CAMERA_ERR("sem wait fail\n");
+	if (CAMERA_CaptureWait(priv, timeout_ms) != 0) {
+		int capture_error = priv->capture_error;
+		CAMERA_CaptureWaitCancel(priv);
+		if (!capture_error && HAL_CSI_StopCapture() != HAL_OK)
+			CAMERA_ERR("still capture did not stop after timeout\n");
+		CAMERA_ERR("capture wait failed\n");
 		return -1;
 	}
 
 	if (fmt == CAMERA_OUT_JPEG) {
-		if (!gJpegParam.mem_part_en && gJpegParam.outstream_buff_size < (priv->encode_len + CAMERA_JPEG_HEADER_LEN))
-			CAMERA_WRN("jpeg buffer size must > %dB\n", priv->encode_len + CAMERA_JPEG_HEADER_LEN);
+		if (!gJpegParam.mem_part_en && gJpegParam.outstream_buff_size <
+		    (priv->encode_len + CAMERA_JPEG_HEADER_LEN))
+			CAMERA_WRN("jpeg buffer size must > %dB\n",
+			           priv->encode_len + CAMERA_JPEG_HEADER_LEN);
 		info->buff_index = priv->encode_buff_id;
 		info->size = priv->encode_len;
 		return 0;
@@ -537,9 +569,10 @@ uint32_t HAL_CAMERA_CaptureVideoData(CAMERA_JpegBuffInfo *info)
 		return -1;
 	}
 
-	priv->sem_wait = 1;
-	if (OS_SemaphoreWait(&priv->sem, 5000) != OS_OK) {
-		CAMERA_ERR("sem wait fail\n");
+	CAMERA_CaptureWaitPrepare(priv);
+	if (CAMERA_CaptureWait(priv, 5000) != 0) {
+		CAMERA_CaptureWaitCancel(priv);
+		CAMERA_ERR("video frame wait failed\n");
 		return -1;
 	}
 
