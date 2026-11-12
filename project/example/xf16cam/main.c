@@ -599,9 +599,22 @@ static void xf16cam_motion_monitor_task(void *arg)
 				CAMERA_JpegBuffInfo info;
 				uint8_t *jpeg;
 				uint32_t jpeg_len;
-				(void)xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
+				int capture_result;
+
+				capture_result = xf16cam_capture_jpeg(&info, &jpeg, &jpeg_len);
+				OS_MutexUnlock(&g_capture_lock);
+				if (capture_result < 0) {
+					printf("xf16cam motion monitor: camera capture failed; reinitializing\\n");
+					xf16cam_camera_release();
+					camera_acquired = 0;
+					g_motion_monitor_camera = 0;
+					xf16cam_motion_reset();
+					OS_MSleep(500);
+					continue;
+				}
+			} else {
+				OS_MutexUnlock(&g_capture_lock);
 			}
-			OS_MutexUnlock(&g_capture_lock);
 		}
 		if (!detection_enabled)
 			xf16cam_motion_reset();
@@ -689,18 +702,23 @@ int xf16cam_mjpeg_start(int fd)
 {
 	int timeout = XF16CAM_RTSP_IO_TIMEOUT_MS;
 
-	if (xf16cam_update_active())
+	if (xf16cam_update_active() ||
+	    __sync_lock_test_and_set(&g_mjpeg_active, 1))
 		return -1;
-	if (g_mjpeg_active)
+	if (xf16cam_camera_acquire() != 0) {
+		g_mjpeg_active = 0;
 		return -1;
-	if (xf16cam_camera_acquire() != 0)
+	}
+	if (xf16cam_update_active()) {
+		xf16cam_camera_release();
+		g_mjpeg_active = 0;
 		return -1;
+	}
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-	g_mjpeg_active = 1;
 	if (OS_ThreadCreate(&g_mjpeg_thread, "xf16cam-mjpeg", xf16cam_mjpeg_task,
 	                    (void *)(intptr_t)fd, OS_THREAD_PRIO_APP, 2 * 1024) != OS_OK) {
-		g_mjpeg_active = 0;
 		xf16cam_camera_release();
+		g_mjpeg_active = 0;
 		return -1;
 	}
 	return 0;
