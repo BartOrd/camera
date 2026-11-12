@@ -66,7 +66,7 @@ static int xf16cam_config_storage_valid(const XF16CamConfig *config)
 		return 0;
 	}
 	if (config->schema == XF16CAM_CONFIG_SCHEMA &&
-	    (config->reserved & ~(XF16CAM_LIGHT_ENABLED_FLAG | XF16CAM_LIGHT_STRONGER_FLAG | XF16CAM_AUTO_DAY_NIGHT_FLAG | XF16CAM_MOTION_ENABLED_FLAG | XF16CAM_MOTION_ALARM_FLAG)) != 0)
+	    (config->reserved & ~(XF16CAM_LIGHT_ENABLED_FLAG | XF16CAM_LIGHT_STRONGER_FLAG | XF16CAM_AUTO_DAY_NIGHT_FLAG | 0x18U)) != 0)
 		return 0;
 	return config->checksum == xf16cam_config_checksum(config);
 }
@@ -332,16 +332,6 @@ static int xf16cam_config_save_flag(uint8_t enabled, uint8_t flag)
 	result = xf16cam_config_write(&config);
 	OS_MutexUnlock(&g_config_lock);
 	return result;
-}
-
-int xf16cam_config_save_motion(uint8_t enabled)
-{
-	return xf16cam_config_save_flag(enabled, XF16CAM_MOTION_ENABLED_FLAG);
-}
-
-int xf16cam_config_save_motion_alarm(uint8_t enabled)
-{
-	return xf16cam_config_save_flag(enabled, XF16CAM_MOTION_ALARM_FLAG);
 }
 
 int xf16cam_update_begin(void)
