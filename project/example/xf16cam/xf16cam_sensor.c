@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 
 #include "compiler.h"
 #include "driver/chip/hal_gpio.h"
@@ -48,6 +49,8 @@ typedef struct {
 	uint16_t probe_table_size;
 	uint16_t table_size;
 	uint16_t post_table_size;
+	const uint8_t *mode_720p_table;
+	uint16_t mode_720p_table_size;
 	uint16_t init_settle_ms;
 	uint16_t input_width;
 	uint16_t input_height;
@@ -60,11 +63,15 @@ typedef struct {
 	uint8_t id_count;
 	XF16CamCsiProfile csi;
 	uint8_t vga_selectable;
+	uint8_t supports_720p;
 	uint8_t power_cycle;
 	uint8_t delay_register[2];
 	uint8_t delay_value[2];
 	uint8_t delay_ms[2];
 } XF16CamSensor;
+
+static uint8_t g_gc2145_init_table[XF16CAM_GC2145_TABLE_SIZE];
+static int g_gc2145_init_table_ready;
 
 /* Every sensor shares one compact probe and register-table backend. */
 __xip_rodata static const XF16CamSensor g_sensors[] = {
@@ -181,6 +188,28 @@ __xip_rodata static const XF16CamSensor g_sensors[] = {
 		.output_height = 240,
 		.vga_selectable = 1,
 		.csi = XF16CAM_CSI_DEFAULT,
+	},
+	{
+		.name = "GC2145",
+		.address = 0x3c,
+		.bank_register = 0xfe,
+		.bank_value = 0x00,
+		.id = { { 0xf0, 0x21 }, { 0xf1, 0x45 } },
+		.id_count = 2,
+		.table = g_gc2145_init_table,
+		.table_size = XF16CAM_GC2145_TABLE_SIZE,
+		.mode_720p_table = xf16cam_gc2145_720p_table,
+		.mode_720p_table_size = XF16CAM_GC2145_720P_TABLE_SIZE,
+		.init_settle_ms = 500,
+		.input_width = 640,
+		.input_height = 480,
+		.output_width = 320,
+		.output_height = 240,
+		.vga_selectable = 1,
+		.supports_720p = 1,
+		.csi = XF16CAM_CSI_PROFILE(CSI_IN_SEQ_UYVY, CSI_POL_NEGATIVE,
+		                             CSI_POL_POSITIVE, CSI_POL_POSITIVE,
+		                             CSI_SYNC_SEPARARE),
 	},
 	{
 		.name = "HI704",
@@ -447,6 +476,53 @@ static HAL_Status xf16cam_sensor_write_table(I2C_ID bus,
 }
 
 __xip_text
+
+static int xf16cam_gc2145_decode_table(void)
+{
+	const char *source = xf16cam_gc2145_table_base64;
+	uint32_t accumulator = 0;
+	uint32_t output = 0;
+	uint8_t bits = 0;
+
+	if (g_gc2145_init_table_ready)
+		return 0;
+	while (*source) {
+		int value;
+		char ch = *source++;
+
+		if (ch == '=')
+			break;
+		if (ch >= 'A' && ch <= 'Z')
+			value = ch - 'A';
+		else if (ch >= 'a' && ch <= 'z')
+			value = ch - 'a' + 26;
+		else if (ch >= '0' && ch <= '9')
+			value = ch - '0' + 52;
+		else if (ch == '+')
+			value = 62;
+		else if (ch == '/')
+			value = 63;
+		else
+			return -1;
+
+		accumulator = (accumulator << 6) | (uint32_t)value;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			if (output >= XF16CAM_GC2145_TABLE_SIZE)
+				return -1;
+			g_gc2145_init_table[output++] =
+				(uint8_t)((accumulator >> bits) & 0xffU);
+		}
+	}
+	if (output != XF16CAM_GC2145_TABLE_SIZE ||
+	    g_gc2145_init_table[output - 2] != 0xff ||
+	    g_gc2145_init_table[output - 1] != 0xff)
+		return -1;
+	g_gc2145_init_table_ready = 1;
+	return 0;
+}
+
 static HAL_Status xf16cam_sensor_load_table(SENSOR_ConfigParam *cfg)
 {
 	I2C_ID bus = (I2C_ID)cfg->i2c_id;
@@ -454,6 +530,11 @@ static HAL_Status xf16cam_sensor_load_table(SENSOR_ConfigParam *cfg)
 
 	if (!g_selected || !g_selected->table || !g_selected->table_size)
 		return HAL_ERROR;
+	if (strcmp(g_selected->name, "GC2145") == 0 &&
+	    xf16cam_gc2145_decode_table() != 0) {
+		printf("xf16cam camera: GC2145 factory table decode failed\n");
+		return HAL_ERROR;
+	}
 	if (g_selected->power_cycle)
 		xf16cam_sensor_power_cycle(cfg);
 	if (xf16cam_sccb_init(bus) != HAL_OK)
@@ -548,28 +629,46 @@ int xf16cam_sensor_configure_camera(uint16_t configured_width,
 		return -1;
 	g_output_width = g_selected->output_width;
 	g_output_height = g_selected->output_height;
-	if (g_selected->vga_selectable && configured_width == 640 &&
-	    configured_height == 480) {
-		g_output_width = g_selected->input_width;
-		g_output_height = g_selected->input_height;
-	}
-	if (g_selected->input_width != configured_width ||
-	    g_selected->input_height != configured_height ||
-	    g_output_width != configured_width ||
-	    g_output_height != configured_height) {
-		input.width = g_selected->input_width;
-		input.height = g_selected->input_height;
+	if (g_selected->supports_720p &&
+	    configured_width == 1280 && configured_height == 720) {
+		if (!g_selected->mode_720p_table ||
+		    xf16cam_sensor_write_table(I2C0_ID, g_selected,
+		                               g_selected->mode_720p_table,
+		                               g_selected->mode_720p_table_size,
+		                               1) != HAL_OK)
+			return -1;
+		OS_MSleep(100);
+		input.width = 1280;
+		input.height = 720;
+		g_output_width = 1280;
+		g_output_height = 720;
 		if (HAL_CAMERA_IoCtl(CAMERA_SET_PIXEL_SIZE, (uint32_t)&input) != 0 ||
 		    HAL_CAMERA_IoCtl(CAMERA_SET_JPEG_MODE, JPEG_MOD_ONLINE) != 0)
 			return -1;
-
-		scale = g_selected->input_width != g_output_width ||
-		        g_selected->input_height != g_output_height;
-		if (scale) {
-			if (g_selected->input_width != g_output_width * 2 ||
-			    g_selected->input_height != g_output_height * 2 ||
-			    HAL_CAMERA_IoCtl(CAMERA_SET_JPEG_SCALE, 1) != 0)
+	} else {
+		if (g_selected->vga_selectable && configured_width == 640 &&
+		    configured_height == 480) {
+			g_output_width = g_selected->input_width;
+			g_output_height = g_selected->input_height;
+		}
+		if (g_selected->input_width != configured_width ||
+		    g_selected->input_height != configured_height ||
+		    g_output_width != configured_width ||
+		    g_output_height != configured_height) {
+			input.width = g_selected->input_width;
+			input.height = g_selected->input_height;
+			if (HAL_CAMERA_IoCtl(CAMERA_SET_PIXEL_SIZE, (uint32_t)&input) != 0 ||
+			    HAL_CAMERA_IoCtl(CAMERA_SET_JPEG_MODE, JPEG_MOD_ONLINE) != 0)
 				return -1;
+
+			scale = g_selected->input_width != g_output_width ||
+			        g_selected->input_height != g_output_height;
+			if (scale) {
+				if (g_selected->input_width != g_output_width * 2 ||
+				    g_selected->input_height != g_output_height * 2 ||
+				    HAL_CAMERA_IoCtl(CAMERA_SET_JPEG_SCALE, 1) != 0)
+					return -1;
+			}
 		}
 	}
 
@@ -644,4 +743,9 @@ uint16_t xf16cam_sensor_height(void)
 int xf16cam_sensor_supports_vga(void)
 {
 	return g_selected && g_selected->vga_selectable;
+}
+
+int xf16cam_sensor_supports_720p(void)
+{
+	return g_selected && g_selected->supports_720p;
 }
