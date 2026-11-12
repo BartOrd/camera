@@ -74,12 +74,6 @@ typedef struct {
 static uint8_t g_gc2145_init_table[XF16CAM_GC2145_TABLE_SIZE];
 static int g_gc2145_init_table_ready;
 
-/* GC0311 page selection sequence recovered from the original camera firmware. */
-static const uint8_t g_gc0311_probe_table[] = {
-	0xfe, 0x01, 0x33, 0x30, 0xfe, 0x00, 0x43, 0x02,
-	0xfe, 0x01, 0x33, 0x20, 0xfe, 0x00, 0x43, 0x00,
-};
-
 /* Every sensor shares one compact probe and register-table backend. */
 __xip_rodata static const XF16CamSensor g_sensors[] = {
 	{
@@ -157,8 +151,6 @@ __xip_rodata static const XF16CamSensor g_sensors[] = {
 	},
 	{
 		.name = "GC0311",
-		.probe_table = g_gc0311_probe_table,
-		.probe_table_size = sizeof(g_gc0311_probe_table),
 		.address = 0x33,
 		.bank_register = 0xfe,
 		.bank_value = 0x00,
