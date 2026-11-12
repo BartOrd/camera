@@ -25,9 +25,19 @@ typedef enum {
 #define XF16CAM_LIGHT_ENABLED_FLAG  (0x01U)
 #define XF16CAM_LIGHT_STRONGER_FLAG (0x02U)
 #define XF16CAM_AUTO_DAY_NIGHT_FLAG (0x04U)
+#define XF16CAM_SENSOR_OVERRIDE_MASK (0x18U)
+#define XF16CAM_SENSOR_OVERRIDE_SHIFT (3U)
+
+typedef enum {
+	XF16CAM_SENSOR_AUTO = 0,
+	XF16CAM_SENSOR_FORCE_GC0311 = 1,
+	XF16CAM_SENSOR_FORCE_GC2145 = 2,
+} XF16CamSensorOverride;
+
 #define XF16CAM_LIGHT_ENABLED(config) (((config)->reserved & XF16CAM_LIGHT_ENABLED_FLAG) != 0)
 #define XF16CAM_LIGHT_STRONGER(config) (((config)->reserved & XF16CAM_LIGHT_STRONGER_FLAG) != 0)
 #define XF16CAM_AUTO_DAY_NIGHT(config) (((config)->reserved & XF16CAM_AUTO_DAY_NIGHT_FLAG) != 0)
+#define XF16CAM_SENSOR_OVERRIDE(config) (((config)->reserved & XF16CAM_SENSOR_OVERRIDE_MASK) >> XF16CAM_SENSOR_OVERRIDE_SHIFT)
 
 typedef struct {
 	uint32_t magic;
@@ -49,6 +59,7 @@ int xf16cam_config_save_ap(void);
 int xf16cam_config_save_media(XF16CamMediaMode mode);
 int xf16cam_config_save_media_and_begin_update(XF16CamMediaMode mode);
 int xf16cam_config_save_resolution(XF16CamResolution resolution);
+int xf16cam_config_save_sensor_override(XF16CamSensorOverride sensor);
 int xf16cam_config_save_light(uint8_t enabled, uint8_t stronger);
 int xf16cam_config_save_daynight(uint8_t enabled);
 int xf16cam_update_begin(void);
