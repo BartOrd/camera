@@ -272,7 +272,7 @@ static int xf16cam_camera_manager_init(void)
 	if (OS_MutexCreate(&g_capture_lock) == OS_OK)
 		g_capture_lock_ready = 1;
 	else
-		printf("xf16cam capture lock create failed; motion monitor is disabled\n");
+		printf("xf16cam capture lock create failed\n");
 	if (xf16_board_camera_power_prepare() != 0)
 		return -1;
 	if (camera_init() != 0) {
