@@ -21,7 +21,6 @@
 #include "xf16cam_config.h"
 #include "xf16cam_light.h"
 #include "xf16cam_audio.h"
-#include "xf16cam_motion.h"
 #include "xf16cam_board.h"
 #include "xf16cam_http.h"
 #include "xf16cam_media.h"
@@ -405,24 +404,7 @@ static void xf16cam_http_page(int fd)
 	XF16CAM_HTTP_SEND_LITERAL(fd, "</span></span><b>IR LED</b><span><span id=irStatus>");
 	xf16cam_http_send_text(fd, xf16cam_board_ir_led_on() ? "On (PA22)" : "Off (PA22)");
 	XF16CAM_HTTP_SEND_LITERAL(fd,
-	                  "</span></span><b>Motion detection</b><span id=motionStatus>");
-	xf16cam_http_send_text(fd, XF16CAM_MOTION_ENABLED(config) ? "Enabled" : "Disabled");
-	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Sound alarm</b><span id=motionAlarmStatus>");
-	xf16cam_http_send_text(fd, XF16CAM_MOTION_ALARM_ENABLED(config) ? "Enabled" : "Disabled");
-	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Motion events</b><span id=motionEvents>");
-	length = snprintf(dynamic, sizeof(dynamic), "%lu",
-	                  (unsigned long)xf16cam_board_motion_events());
-	xf16cam_http_send_all(fd, dynamic, length);
-	XF16CAM_HTTP_SEND_LITERAL(fd, "</span><b>Last motion</b><span id=motionLast>");
-	if (xf16cam_board_motion_active())
-		XF16CAM_HTTP_SEND_LITERAL(fd, "Motion detected");
-	else if (xf16cam_board_motion_age_ms() == 0xffffffffUL)
-		XF16CAM_HTTP_SEND_LITERAL(fd, "No events");
-	else {
-		length = snprintf(dynamic, sizeof(dynamic), "%lu s ago",
-		                  (unsigned long)(xf16cam_board_motion_age_ms() / 1000U));
-		xf16cam_http_send_all(fd, dynamic, length);
-	}
+	                  "</span></span></div><form method=post action=/api/light>"
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "</span></span></div><form method=post action=/api/light>"
 	                  "<button class=manual-light data-active=");
@@ -455,23 +437,6 @@ static void xf16cam_http_page(int fd)
 	if (XF16CAM_AUTO_DAY_NIGHT(config))
 		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
 	XF16CAM_HTTP_SEND_LITERAL(fd, ">Auto day/night on</button></form>"
-	                  "<small>Automatic mode disables manual light controls and switches the IR-cut filter / IR LED using the light sensor.</small>"
-	                  "<form method=post action=/api/motion><button onclick='motionSubmit(this);return false' name=motion value=disabled");
-	if (!XF16CAM_MOTION_ENABLED(config))
-		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
-	XF16CAM_HTTP_SEND_LITERAL(fd, ">Motion off</button> <button onclick='motionSubmit(this);return false' name=motion value=enabled");
-	if (XF16CAM_MOTION_ENABLED(config))
-		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
-	XF16CAM_HTTP_SEND_LITERAL(fd, ">Motion on</button></form>"
-	                  "<form method=post action=/api/motion><button onclick='motionSubmit(this);return false' name=alarm value=disabled");
-	if (!XF16CAM_MOTION_ALARM_ENABLED(config))
-		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
-	XF16CAM_HTTP_SEND_LITERAL(fd, ">Sound alarm off</button> <button onclick='motionSubmit(this);return false' name=alarm value=enabled");
-	if (XF16CAM_MOTION_ALARM_ENABLED(config))
-		XF16CAM_HTTP_SEND_LITERAL(fd, " disabled");
-	XF16CAM_HTTP_SEND_LITERAL(fd, ">Sound alarm on</button></form>"
-	                  "<small>Motion turns on the white fill light for 15 seconds when movement is detected at night. The sound alarm works independently of Motion.</small>"
-	                  "<span id=motionResult aria-live=polite></span>"
 	                  "<span id=lightResult aria-live=polite></span></section></div>");
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "<div id=position class=panel><section class='card wide'><h2>Position</h2>"
@@ -594,13 +559,6 @@ static void xf16cam_http_page(int fd)
 	                  "A('.manual-light').forEach(x=>x.disabled=v==='enabled'||x.dataset.active==='1')}"
 	                  "s.textContent='Saved'})"
 	                  ".catch(()=>{s.textContent='Save failed';b.disabled=false});return false}"
-	                  "function motionSubmit(b){let f=b.form,s=$('#motionResult'),k=b.name,v=b.value;"
-	                  "if(!f||b.disabled)return false;b.disabled=true;s.textContent='Saving...';"
-	                  "fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-	                  "body:encodeURIComponent(k)+'='+encodeURIComponent(v)})"
-	                  ".then(r=>{if(!r.ok)throw 0;return r.text()})"
-	                  ".then(()=>{f.querySelectorAll('button').forEach(x=>x.disabled=x.value===v);s.textContent='Saved'})"
-	                  ".catch(()=>{s.textContent='Save failed';b.disabled=false});return false}"
 	                  "let ptzPressTimer=0,ptzHolding=false,ptzMode='',ptzStartPromise=null;"
                   "async function ptzSend(mode,action){let d=new URLSearchParams();d.set('mode',mode);d.set('action',action);"
                   "let r=await fetch('/api/ptz',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:d.toString()});"
@@ -638,13 +596,9 @@ static void xf16cam_http_page(int fd)
 	                  "ok=r.ok;s.textContent=ok?t:'Update failed (HTTP '+r.status+')'}catch(e){s.textContent='Connection closed; check for reboot'}finally{b.disabled=false;if(!ok){vh=0;videoStart()}}}"
 	                  "async function meter(){if(!D.hidden&&$('#live').classList.contains('on'))try{"
 	                  "let a=await(await fetch('/api/audio')).json(),m=$('#mic');if(m)m.textContent=a.peak}catch(e){}setTimeout(meter,2000)}"
-	                  "async function motionPoll(){if(!D.hidden)try{let m=await(await fetch('/api/motion')).json();"
-	                  "$('#motionStatus').textContent=m.enabled?'Enabled':'Disabled';$('#motionAlarmStatus').textContent=m.alarm?'Enabled':'Disabled';"
-	                  "$('#motionEvents').textContent=m.events;$('#motionLast').textContent=m.active?'Motion detected':"
-	                  "m.age_ms===4294967295?'No events':Math.floor(m.age_ms/1000)+' s ago'}catch(e){}setTimeout(motionPoll,2000)}"
 	                  "let v=$('#video');if(v){v.onerror=videoRetry;videoStart()}"
 	                  "D.addEventListener('visibilitychange',()=>D.hidden?videoStop():videoStart());"
-	                  "tab('live');meter();motionPoll()</script></main></body></html>");
+	                  "tab('live');meter()</script></main></body></html>");
 }
 
 __xip_text
@@ -997,19 +951,7 @@ static int xf16cam_http_handle(int fd)
 		xf16cam_http_scan_json(fd);
 	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/audio") == 0) {
 		xf16cam_http_audio_json(fd);
-	} else if (strcmp(method, "GET") == 0 && strcmp(path, "/api/motion") == 0) {
-		const XF16CamConfig *config = xf16cam_config_get();
-		char response[192];
-		int length = snprintf(response, sizeof(response),
-		                      "{\"enabled\":%s,\"alarm\":%s,\"events\":%lu,\"active\":%s,\"age_ms\":%lu}",
-		                      XF16CAM_MOTION_ENABLED(config) ? "true" : "false",
-		                      XF16CAM_MOTION_ALARM_ENABLED(config) ? "true" : "false",
-		                      (unsigned long)xf16cam_board_motion_events(),
-		                      xf16cam_board_motion_active() ? "true" : "false",
-		                      (unsigned long)xf16cam_board_motion_age_ms());
-		xf16cam_http_begin_length(fd, "200 OK", "application/json", length);
-		xf16cam_http_send_all(fd, response, length);
-	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/power") == 0) {
+		} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/power") == 0) {
 		xf16cam_http_power_json(fd);
 	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/wifi") == 0) {
 		int invalid = xf16cam_form_value(body, "ssid", ssid, sizeof(ssid)) != 0 ||
@@ -1104,43 +1046,7 @@ static int xf16cam_http_handle(int fd)
 			xf16cam_board_set_ir_led(0);
 		xf16cam_light_apply();
 		xf16cam_http_message(fd, "200 OK", "Light settings saved and applied. Return to the panel to view the current state.");
-	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/motion") == 0) {
-		uint8_t enabled = 0;
-		int setting = 0;
-		int valid = 0;
-
-		if (xf16cam_form_value(body, "motion", mode, sizeof(mode)) == 0) {
-			setting = 1;
-			if (strcmp(mode, "enabled") == 0) {
-				enabled = 1;
-				valid = 1;
-			} else if (strcmp(mode, "disabled") == 0) {
-				enabled = 0;
-				valid = 1;
-			}
-		} else if (xf16cam_form_value(body, "alarm", mode, sizeof(mode)) == 0) {
-			setting = 2;
-			if (strcmp(mode, "enabled") == 0) {
-				enabled = 1;
-				valid = 1;
-			} else if (strcmp(mode, "disabled") == 0) {
-				enabled = 0;
-				valid = 1;
-			}
-		}
-		if (!valid) {
-			xf16cam_http_message(fd, "400 Bad Request", "Invalid motion setting.");
-			return XF16CAM_HTTP_KEEP_RUNNING;
-		}
-		if ((setting == 1 && xf16cam_config_save_motion(enabled) != 0) ||
-		    (setting == 2 && xf16cam_config_save_motion_alarm(enabled) != 0)) {
-			xf16cam_http_message(fd, "500 Internal Server Error", "Could not save motion settings to flash.");
-			return XF16CAM_HTTP_KEEP_RUNNING;
-		}
-		if (setting == 1 && !enabled)
-			xf16cam_motion_reset();
-		xf16cam_http_message(fd, "200 OK", "Motion settings saved. Return to the panel to see updated status.");
-	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ptz") == 0) {
+		} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/ptz") == 0) {
 		char action[12];
 		int direction = 0;
 
