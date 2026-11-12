@@ -19,6 +19,7 @@ typedef enum {
 typedef enum {
 	XF16CAM_RESOLUTION_QVGA = 0,
 	XF16CAM_RESOLUTION_VGA = 1,
+	XF16CAM_RESOLUTION_720P = 2,
 } XF16CamResolution;
 
 #define XF16CAM_LIGHT_ENABLED_FLAG  (0x01U)
