@@ -8,6 +8,7 @@
 #include "kernel/os/os.h"
 
 #include "xf16cam_sensor.h"
+#include "xf16cam_config.h"
 #include "xf16cam_sensor_tables.h"
 
 #define XF16CAM_SENSOR_SETTLE_MS (100)
@@ -72,6 +73,12 @@ typedef struct {
 
 static uint8_t g_gc2145_init_table[XF16CAM_GC2145_TABLE_SIZE];
 static int g_gc2145_init_table_ready;
+
+/* GC0311 page selection sequence recovered from the original camera firmware. */
+static const uint8_t g_gc0311_probe_table[] = {
+	0xfe, 0x01, 0x33, 0x30, 0xfe, 0x00, 0x43, 0x02,
+	0xfe, 0x01, 0x33, 0x20, 0xfe, 0x00, 0x43, 0x00,
+};
 
 /* Every sensor shares one compact probe and register-table backend. */
 __xip_rodata static const XF16CamSensor g_sensors[] = {
@@ -150,6 +157,8 @@ __xip_rodata static const XF16CamSensor g_sensors[] = {
 	},
 	{
 		.name = "GC0311",
+		.probe_table = g_gc0311_probe_table,
+		.probe_table_size = sizeof(g_gc0311_probe_table),
 		.address = 0x33,
 		.bank_register = 0xfe,
 		.bank_value = 0x00,
@@ -331,9 +340,30 @@ __xip_rodata static const XF16CamSensor g_sensors[] = {
 };
 
 static const XF16CamSensor *g_selected;
+static uint8_t g_selected_index = 0xff;
+static int g_selected_forced;
 static int g_sensor_night_mode;
 static uint16_t g_output_width;
 static uint16_t g_output_height;
+#define XF16CAM_SENSOR_COUNT (sizeof(g_sensors) / sizeof(g_sensors[0]))
+static XF16CamSensorDiagnostic g_sensor_diagnostics[XF16CAM_SENSOR_COUNT];
+
+static void xf16cam_sensor_diag_reset(void)
+{
+	unsigned int index;
+
+	memset(g_sensor_diagnostics, 0, sizeof(g_sensor_diagnostics));
+	for (index = 0; index < XF16CAM_SENSOR_COUNT; ++index) {
+		unsigned int id;
+		g_sensor_diagnostics[index].name = g_sensors[index].name;
+		g_sensor_diagnostics[index].address = g_sensors[index].address;
+		g_sensor_diagnostics[index].id_count = g_sensors[index].id_count;
+		for (id = 0; id < g_sensors[index].id_count && id < 2; ++id) {
+			g_sensor_diagnostics[index].id_register[id] = g_sensors[index].id[id].reg;
+			g_sensor_diagnostics[index].expected_id[id] = g_sensors[index].id[id].value;
+		}
+	}
+}
 
 __xip_text
 void xf16cam_sensor_prepare_capture(void)
@@ -398,16 +428,28 @@ static HAL_Status xf16cam_sensor_write_table(I2C_ID bus,
 
 __xip_text
 static int xf16cam_sensor_probe(I2C_ID bus, const XF16CamSensor *sensor,
-				uint8_t *chip_id)
+				uint8_t *chip_id,
+				XF16CamSensorDiagnostic *diagnostic)
 {
 	uint8_t value = sensor->bank_value;
 	unsigned int index;
+	int matched = 1;
 
+	if (diagnostic) {
+		if (diagnostic->attempts < 255)
+			++diagnostic->attempts;
+		diagnostic->matched = 0;
+		diagnostic->status = XF16CAM_SENSOR_PROBE_IO_ERROR;
+		memset(diagnostic->read_ok, 0, sizeof(diagnostic->read_ok));
+		memset(diagnostic->actual_id, 0, sizeof(diagnostic->actual_id));
+	}
 	if (sensor->probe_table && sensor->probe_table_size &&
 	    xf16cam_sensor_write_table(bus, sensor, sensor->probe_table,
-	                               sensor->probe_table_size, 0) != HAL_OK)
+	                               sensor->probe_table_size, 0) != HAL_OK) {
+		if (diagnostic)
+			diagnostic->status = XF16CAM_SENSOR_PROBE_TABLE_ERROR;
 		return 0;
-	/* Factory descriptors use FF/FF for sensors without a bank selector. */
+	}
 	if ((sensor->bank_register != 0xff || sensor->bank_value != 0xff) &&
 	    HAL_I2C_SCCB_Master_Transmit_IT(bus, sensor->address,
 	                                    sensor->bank_register, &value) != 1)
@@ -421,14 +463,22 @@ static int xf16cam_sensor_probe(I2C_ID bus, const XF16CamSensor *sensor,
 		if (HAL_I2C_SCCB_Master_Receive_IT(bus, sensor->address,
 		                                 id->reg, &value) != 1)
 			return 0;
+		if (diagnostic) {
+			diagnostic->read_ok[index] = 1;
+			diagnostic->actual_id[index] = value;
+		}
 		if (index == 0)
 			*chip_id = value;
 		if (value != id->value)
-			return 0;
+			matched = 0;
 	}
-	return 1;
+	if (diagnostic) {
+		diagnostic->matched = matched ? 1 : 0;
+		diagnostic->status = matched ? XF16CAM_SENSOR_PROBE_MATCH :
+		                                XF16CAM_SENSOR_PROBE_ID_MISMATCH;
+	}
+	return matched;
 }
-
 __xip_text
 static HAL_Status xf16cam_sensor_write_table(I2C_ID bus,
 					     const XF16CamSensor *sensor,
@@ -526,7 +576,9 @@ static int xf16cam_gc2145_decode_table(void)
 static HAL_Status xf16cam_sensor_load_table(SENSOR_ConfigParam *cfg)
 {
 	I2C_ID bus = (I2C_ID)cfg->i2c_id;
-	uint8_t chip_id;
+	uint8_t chip_id = 0;
+	XF16CamSensorDiagnostic *diagnostic = g_selected_index < XF16CAM_SENSOR_COUNT ?
+		&g_sensor_diagnostics[g_selected_index] : NULL;
 
 	if (!g_selected || !g_selected->table || !g_selected->table_size)
 		return HAL_ERROR;
@@ -540,11 +592,15 @@ static HAL_Status xf16cam_sensor_load_table(SENSOR_ConfigParam *cfg)
 	if (xf16cam_sccb_init(bus) != HAL_OK)
 		return HAL_ERROR;
 	if (g_selected->power_cycle &&
-	    !xf16cam_sensor_probe(bus, g_selected, &chip_id)) {
-		printf("xf16cam camera: %s did not return after power cycle\n",
-		       g_selected->name);
-		HAL_I2C_DeInit(bus);
-		return HAL_ERROR;
+	    !xf16cam_sensor_probe(bus, g_selected, &chip_id, diagnostic)) {
+		if (!g_selected_forced) {
+			printf("xf16cam camera: %s did not return after power cycle\n",
+			       g_selected->name);
+			HAL_I2C_DeInit(bus);
+			return HAL_ERROR;
+		}
+		printf("xf16cam camera: forced %s profile despite ID mismatch (0x%02x)\n",
+		       g_selected->name, chip_id);
 	}
 	if (xf16cam_sensor_write_table(bus, g_selected, g_selected->table,
 	                                g_selected->table_size, 1) != HAL_OK ||
@@ -561,6 +617,48 @@ static HAL_Status xf16cam_sensor_load_table(SENSOR_ConfigParam *cfg)
 	return HAL_OK;
 }
 
+static int xf16cam_sensor_find_override(XF16CamSensorOverride override)
+{
+	unsigned int index;
+	const char *name = override == XF16CAM_SENSOR_FORCE_GC0311 ? "GC0311" :
+	                   override == XF16CAM_SENSOR_FORCE_GC2145 ? "GC2145" : NULL;
+
+	if (!name)
+		return -1;
+	for (index = 0; index < XF16CAM_SENSOR_COUNT; ++index) {
+		if (strcmp(g_sensors[index].name, name) == 0)
+			return (int)index;
+	}
+	return -1;
+}
+
+static HAL_Status xf16cam_sensor_activate(SENSOR_ConfigParam *cfg,
+					  unsigned int index,
+					  uint8_t chip_id,
+					  int forced)
+{
+	HAL_Status status;
+
+	g_selected_index = (uint8_t)index;
+	g_selected = &g_sensors[index];
+	g_selected_forced = forced;
+	g_output_width = g_selected->output_width;
+	g_output_height = g_selected->output_height;
+	g_sensor_diagnostics[index].selected = 1;
+	HAL_I2C_DeInit((I2C_ID)cfg->i2c_id);
+	printf("xf16cam camera: %s %s (id=0x%02x)\n",
+	       g_selected->name, forced ? "profile selected" : "detected", chip_id);
+	if (forced && !g_sensor_diagnostics[index].matched)
+		printf("xf16cam camera: WARNING: forced profile; chip ID did not match\n");
+	status = xf16cam_sensor_load_table(cfg);
+	if (status != HAL_OK) {
+		g_sensor_diagnostics[index].selected = 0;
+		g_selected = NULL;
+		g_selected_index = 0xff;
+	}
+	return status;
+}
+
 __xip_text
 HAL_Status xf16cam_sensor_init(SENSOR_ConfigParam *cfg)
 {
@@ -569,35 +667,61 @@ HAL_Status xf16cam_sensor_init(SENSOR_ConfigParam *cfg)
 	uint8_t chip_id = 0;
 	unsigned int phase;
 	unsigned int index;
+	int forced_index;
 
 	if (!cfg)
 		return HAL_ERROR;
 	bus = (I2C_ID)cfg->i2c_id;
 	g_selected = NULL;
+	g_selected_index = 0xff;
+	g_selected_forced = 0;
 	g_output_width = 0;
 	g_output_height = 0;
+	xf16cam_sensor_diag_reset();
+	forced_index = xf16cam_sensor_find_override(
+		(XF16CamSensorOverride)XF16CAM_SENSOR_OVERRIDE(xf16cam_config_get()));
 
 	for (phase = 0; phase < sizeof(control_states) / sizeof(control_states[0]); ++phase) {
 		xf16cam_sensor_control(cfg, control_states[phase]);
 		if (xf16cam_sccb_init(bus) != HAL_OK)
 			return HAL_ERROR;
-		for (index = 0; index < sizeof(g_sensors) / sizeof(g_sensors[0]); ++index) {
-			if (xf16cam_sensor_probe(bus, &g_sensors[index], &chip_id)) {
-				HAL_Status status;
-
-				g_selected = &g_sensors[index];
-				g_output_width = g_selected->output_width;
-				g_output_height = g_selected->output_height;
-				HAL_I2C_DeInit(bus);
-				printf("xf16cam camera: %s detected (id=0x%02x)\n",
-				       g_selected->name, chip_id);
-				status = xf16cam_sensor_load_table(cfg);
-				if (status != HAL_OK)
-					g_selected = NULL;
-				return status;
+		if (forced_index >= 0) {
+			XF16CamSensorDiagnostic *diagnostic =
+				&g_sensor_diagnostics[forced_index];
+			int matched = xf16cam_sensor_probe(bus, &g_sensors[forced_index],
+			                                   &chip_id, diagnostic);
+			if (matched)
+				return xf16cam_sensor_activate(cfg, forced_index,
+				                               chip_id, 1);
+		} else {
+			for (index = 0; index < XF16CAM_SENSOR_COUNT; ++index) {
+				if (xf16cam_sensor_probe(bus, &g_sensors[index], &chip_id,
+				                         &g_sensor_diagnostics[index]))
+					return xf16cam_sensor_activate(cfg, index, chip_id, 0);
 			}
 		}
 		HAL_I2C_DeInit(bus);
+	}
+
+	if (forced_index >= 0) {
+		XF16CamSensorDiagnostic *diagnostic =
+			&g_sensor_diagnostics[forced_index];
+		g_selected_index = (uint8_t)forced_index;
+		g_selected = &g_sensors[forced_index];
+		g_selected_forced = 1;
+		g_output_width = g_selected->output_width;
+		g_output_height = g_selected->output_height;
+		diagnostic->selected = 1;
+		printf("xf16cam camera: forcing %s after two unsuccessful ID probes\n",
+		       g_selected->name);
+		printf("xf16cam camera: WARNING: profile register table will be applied even if ID mismatches\n");
+		if (xf16cam_sensor_load_table(cfg) != HAL_OK) {
+			diagnostic->selected = 0;
+			g_selected = NULL;
+			g_selected_index = 0xff;
+			return HAL_ERROR;
+		}
+		return HAL_OK;
 	}
 
 	printf("xf16cam camera: no supported sensor (last id=0x%02x)\n", chip_id);
@@ -748,4 +872,19 @@ int xf16cam_sensor_supports_vga(void)
 int xf16cam_sensor_supports_720p(void)
 {
 	return g_selected && g_selected->supports_720p;
+}
+
+uint8_t xf16cam_sensor_diagnostic_count(void)
+{
+	return (uint8_t)XF16CAM_SENSOR_COUNT;
+}
+
+const XF16CamSensorDiagnostic *xf16cam_sensor_diagnostic(uint8_t index)
+{
+	return index < XF16CAM_SENSOR_COUNT ? &g_sensor_diagnostics[index] : NULL;
+}
+
+XF16CamSensorOverride xf16cam_sensor_override_mode(void)
+{
+	return (XF16CamSensorOverride)XF16CAM_SENSOR_OVERRIDE(xf16cam_config_get());
 }
